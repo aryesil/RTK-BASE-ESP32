@@ -355,7 +355,11 @@ void setup() {
   delay(100);
   Serial2.println("$PAIR062,3,1*3C"); 
   delay(2000);
-  Serial2.println("$PQTMCFGSVIN,W,1,300,1,0,0,0*20"); 
+  Serial2.println("$PQTMCFGSVIN,W,1,300,1,0,0,0*20");
+  delay(100);
+  Serial2.println("$PAIR432,1*22"); 
+  delay(100);
+  Serial2.println("$PAIR436,1*26");
 }
 
 // ==========================================
