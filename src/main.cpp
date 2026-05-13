@@ -24,6 +24,10 @@ TinyGPSPlus gps;
 #define TXD2 16
 #define GNSS_BAUD 115200 
 #define PPS_PIN 27
+// TCP RTCM Yayın Sunucusu
+#define RTCM_PORT 2101
+WiFiServer rtcmServer(RTCM_PORT);
+WiFiClient tcpClients[3]; // Aynı anda 3 istemciye kadar hizmet verebilecek şekilde dizi
 
 // --- YENİ: Kapsamlı Uydu Veri Yapısı (ID, Tip, Elevasyon, Azimut, SNR) ---
 struct SatData {
@@ -100,6 +104,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             <div>PPS Durumu: <span id="pps_status" class="value alert">KİLİT YOK</span></div>
             <div>PPS Sayacı: <span id="pps_count" class="value">0</span></div>
             <div>RTCM3 Akışı: <span id="rtcm" class="value">0</span> pkt/sn</div>
+            <div>TCP Yayın (Port 2101): <span id="tcp_clients" class="value" style="color:#00ffcc">0</span> İstemci</div>
             <div id="map"></div>
         </div>
 
@@ -234,6 +239,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             document.getElementById('hdop').innerText = data.hdop.toFixed(2);
             // Sistem Verileri (PPS ve RTCM)            
             document.getElementById('rtcm').innerText = data.rtcm;
+            document.getElementById('tcp_clients').innerText = data.tcp_clients;
             document.getElementById('pps_count').innerText = data.pps_count;
             
             var ppsEl = document.getElementById('pps_status');
@@ -337,10 +343,11 @@ void setup() {
 
   // Web Sunucu Yönlendirmeleri
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send_P(200, "text/html", index_html);
+   request->send_P(200, "text/html", index_html);
   });
   
   server.addHandler(&ws);
+  rtcmServer.begin();
   server.begin();
 
   // Modül Ayarları (GGA, GSV, Survey-In)
@@ -355,20 +362,46 @@ void setup() {
 // 6. ANA DÖNGÜ (LOOP)
 // ==========================================
 void loop() {
-  // 1. Modülden Gelen Veriyi Oku
-  while (Serial2.available() > 0) {
-    uint8_t b = Serial2.read();
-    gps.encode(b);
+  // --- 1. TCP İstemci Bağlantı Kontrolü ---
+  if (rtcmServer.hasClient()) {
+    bool added = false;
+    for (int i = 0; i < 3; i++) {
+      if (!tcpClients[i] || !tcpClients[i].connected()) {
+        if (tcpClients[i]) tcpClients[i].stop();
+        tcpClients[i] = rtcmServer.available();
+        added = true;
+        break;
+      }
+    }
+    if (!added) rtcmServer.available().stop(); // Kapasite doluysa reddet
+  }
 
-    // RTCM Paketi Yakalama
-    if (b == 0xD3) rtcmPaketSayaci++;
+  // --- 2. UART Veri Okuma ve TCP Yayını ---
+  size_t bytesAvailable = Serial2.available();
+  if (bytesAvailable > 0) {
+    uint8_t buf[128]; // Hızlı transfer için tampon (Buffer)
+    if (bytesAvailable > sizeof(buf)) bytesAvailable = sizeof(buf);
+    
+    size_t len = Serial2.read(buf, bytesAvailable);
 
-    // NMEA Özel Cümle Yakalama
-    if (b == '$') {
-      uyduTipleriniAyristir(nmeaTampon);
-      nmeaTampon = "$";
-    } else if (b != '\r' && b != '\n') {
-      nmeaTampon += (char)b;
+    // A) Veriyi TCP İstemcilerine Fırlat
+    for (int i = 0; i < 3; i++) {
+      if (tcpClients[i] && tcpClients[i].connected()) {
+        tcpClients[i].write(buf, len);
+      }
+    }
+
+    // B) Kendi Sistemimiz İçin Veriyi Ayrıştır
+    for (size_t i = 0; i < len; i++) {
+      uint8_t b = buf[i];
+      gps.encode(b);
+      if (b == 0xD3) rtcmPaketSayaci++;
+      if (b == '$') {
+        uyduTipleriniAyristir(nmeaTampon);
+        nmeaTampon = "$";
+      } else if (b != '\r' && b != '\n') {
+        nmeaTampon += (char)b;
+      }
     }
   }
 
@@ -385,6 +418,12 @@ void loop() {
       doc["lon"] = gps.location.isValid() ? gps.location.lng() : 0.0;
       doc["alt"] = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
       doc["hdop"] = gps.hdop.isValid() ? gps.hdop.hdop() : 0.0;
+      // Kaç TCP İstemcisi Bağlı?
+      int activeTcp = 0;
+      for (int i = 0; i < 3; i++) {
+        if (tcpClients[i] && tcpClients[i].connected()) activeTcp++;
+      }
+      doc["tcp_clients"] = activeTcp;
 
       // Sistem ve Sayaç Verileri
       doc["rtcm"] = rtcmPaketSayaci;
