@@ -25,12 +25,13 @@ TinyGPSPlus gps;
 #define GNSS_BAUD 115200 
 #define PPS_PIN 27
 
-// --- YENİ: Kapsamlı Uydu Veri Yapısı (ID, Tip, Elevasyon, Azimut) ---
+// --- YENİ: Kapsamlı Uydu Veri Yapısı (ID, Tip, Elevasyon, Azimut, SNR) ---
 struct SatData {
   int id;
   String sys; 
   int elev;   
   int azim;   
+  int snr;    // Sinyal Gücü (Glow efekti için)
   
   // Set içinde mükerrer uyduları engellemek için kimlik kuralı
   bool operator<(const SatData& other) const {
@@ -114,7 +115,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <div class="sat-box"><span>QZS</span><div id="s-qzs" class="value">0</div></div>
             </div>
             <h3 style="margin-top: 15px;">🌌 SKYVIEW (Canlı Radar)</h3>
-            <canvas id="skyview" width="200" height="200"></canvas>
+            <canvas id="skyview" width="500" height="500"></canvas>
         </div>
     </div>
 
@@ -125,13 +126,31 @@ const char index_html[] PROGMEM = R"rawliteral(
         var marker = L.marker([41.0, 28.9]).addTo(map);
         var firstLock = false;
 
-        // Skyview Çizimi (Matematiksel Koordinat Çevirici)
+        // 1. BAYRAKLARI ÖNCEDEN YÜKLEME
+        var flags = {};
+        var flagUrls = {
+            "GP": "https://flagcdn.com/w40/us.png", // GPS (ABD)
+            "GL": "https://flagcdn.com/w40/ru.png", // GLONASS (Rusya)
+            "GA": "https://flagcdn.com/w40/eu.png", // Galileo (Avrupa Birliği)
+            "GB": "https://flagcdn.com/w40/cn.png", // Beidou (Çin)
+            "GI": "https://flagcdn.com/w40/in.png", // NavIC (Hindistan)
+            "GQ": "https://flagcdn.com/w40/jp.png"  // QZSS (Japonya)
+        };
+        
+        for(let key in flagUrls){
+            let img = new Image();
+            img.src = flagUrls[key];
+            flags[key] = img;
+        }
+
+        // Skyview Çizimi (Bayrak Baloncuklu + Glow + Pro Etiket)
         function drawSkyview(skyData) {
             var canvas = document.getElementById("skyview");
             var ctx = canvas.getContext("2d");
-            var cx = canvas.width / 2; var cy = canvas.height / 2; var r = cx - 5;
+            // Çemberleri çizerken kenarlarda rozetlere pay bırakmak için yarıçapı 25px küçülttük
+            var cx = canvas.width / 2; var cy = canvas.height / 2; var r = cx - 25; 
             
-            // Ekranı Temizle ve Pusula İzini Çiz
+            // Ekranı Temizle ve Radar İzini Çiz
             ctx.clearRect(0, 0, canvas.width, canvas.height);
             ctx.strokeStyle = "#444"; ctx.lineWidth = 1;
             [r, r*0.66, r*0.33].forEach(rad => { ctx.beginPath(); ctx.arc(cx, cy, rad, 0, 2*Math.PI); ctx.stroke(); });
@@ -147,23 +166,56 @@ const char index_html[] PROGMEM = R"rawliteral(
                 var x = cx + satR * Math.cos(rad);
                 var y = cy + satR * Math.sin(rad);
 
-                // Renklendirme Sistemi
-                ctx.fillStyle = sat.s === "GP" ? "#ff4444" : // Kırmızı
-                                sat.s === "GL" ? "#44ff44" : // Yeşil
-                                sat.s === "GA" ? "#4444ff" : // Mavi
-                                sat.s === "GB" ? "#ffff44" : // Sarı
-                                "#ffffff"; // Diğer
+                var balonYaricap = 10; // 500x500 canvas'a uygun tok bir boyut
 
+                // --- 1. SİNYAL GÜCÜ PARLAMASI (GLOW) ---
+                var glowColor = sat.sn > 35 ? "rgba(0, 255, 0, 0.7)" : // Güçlü: Yeşil
+                                sat.sn > 25 ? "rgba(255, 255, 0, 0.7)" : // Orta: Sarı
+                                "rgba(255, 0, 0, 0.7)"; // Zayıf: Kırmızı
+
+                ctx.save();
+                ctx.shadowBlur = (sat.sn / 2) + 5; // Sinyal gücüne göre halkanın büyüklüğü
+                ctx.shadowColor = glowColor;
+                ctx.fillStyle = glowColor;
                 ctx.beginPath();
-                ctx.arc(x, y, 4, 0, 2*Math.PI);
+                ctx.arc(x, y, balonYaricap + 2, 0, 2*Math.PI);
                 ctx.fill();
+                ctx.restore(); // Parlama ayarlarını temizle
+
+                // --- 2. BAYRAK ROZETİ (CLIPPING MASK) ---
+                ctx.save(); 
+                ctx.beginPath();
+                ctx.arc(x, y, balonYaricap, 0, 2*Math.PI);
+                ctx.clip(); // Yuvarlağı kesici kalıp yap
+
+                if(flags[sat.s] && flags[sat.s].complete) {
+                    ctx.drawImage(flags[sat.s], x - balonYaricap, y - balonYaricap, balonYaricap*2, balonYaricap*2);
+                } else {
+                    ctx.fillStyle = "#888"; 
+                    ctx.fill();
+                }
+                ctx.restore(); // Kırpmayı iptal et
+
+                // YUVARLAĞIN ETRAFINA ÇERÇEVE
+                ctx.beginPath();
+                ctx.arc(x, y, balonYaricap, 0, 2*Math.PI);
+                ctx.strokeStyle = "#fff";
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+
+                // --- 3. PROFESYONEL ALPHA-NUMERIC ETİKET (G14, E22 vb.) ---
+                var sysPrefix = sat.s === "GP" ? "G" : sat.s === "GL" ? "R" : 
+                                sat.s === "GA" ? "E" : sat.s === "GB" ? "B" :
+                                sat.s === "GI" ? "I" : sat.s === "GQ" ? "Q" : "U";
                 
-                ctx.fillStyle = "#aaa";
-                ctx.font = "8px Arial";
-                ctx.fillText(sat.s + sat.id, x + 5, y + 3);
+                ctx.fillStyle = "#eee";
+                ctx.font = "bold 11px Arial";
+                ctx.textAlign = "left";
+                // Etiketi baloncuğun hemen sağına ortalayarak yazdırıyoruz
+                ctx.fillText(sysPrefix + sat.id, x + balonYaricap + 4, y + 4);
             });
         }
-        drawSkyview(); // Başlangıçta boş çiz
+        drawSkyview();
 
         // WebSocket İşlemleri
         var gateway = `ws://${window.location.hostname}/ws`;
@@ -175,14 +227,12 @@ const char index_html[] PROGMEM = R"rawliteral(
 
         function onMessage(event) {
             var data = JSON.parse(event.data);
-            
-            // Konum Verileri
+            // Konum Verileri            
             document.getElementById('lat').innerText = data.lat.toFixed(6);
             document.getElementById('lon').innerText = data.lon.toFixed(6);
             document.getElementById('alt').innerText = data.alt.toFixed(2);
             document.getElementById('hdop').innerText = data.hdop.toFixed(2);
-            
-            // Sistem Verileri (PPS ve RTCM)
+            // Sistem Verileri (PPS ve RTCM)            
             document.getElementById('rtcm').innerText = data.rtcm;
             document.getElementById('pps_count').innerText = data.pps_count;
             
@@ -206,6 +256,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             var totalSats = data.sats.gps + data.sats.glo + data.sats.gal + data.sats.bei + data.sats.nav + data.sats.qzs;
             document.getElementById('total_sats').innerText = totalSats;
 
+          
             // Harita Güncelleme
             if(data.lat !== 0.0 && data.lon !== 0.0) {
                 var newLatLng = new L.LatLng(data.lat, data.lon);
@@ -213,9 +264,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                 if(!firstLock) {
                     map.setView(newLatLng, 18);
                     firstLock = true;
-                }
-            }
-
+                }            }
             // Skyview Radarını Güncelle
             if(data.sky) {
                 drawSkyview(data.sky);
@@ -228,7 +277,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 )rawliteral";
 
 // ==========================================
-// 4. YENİ NMEA AYRIŞTIRICI (ID + ELEVASYON + AZİMUT)
+// 4. YENİ NMEA AYRIŞTIRICI (ID + ELEVASYON + AZİMUT + SNR)
 // ==========================================
 void uyduTipleriniAyristir(String nmea) {
   if (nmea.indexOf("GSV") != -1) {
@@ -249,15 +298,16 @@ void uyduTipleriniAyristir(String nmea) {
       }
     }
 
-    // GSV mesajlarında veriler 4. virgülden itibaren 4'lü paketler halinde gelir: [ID, Elev, Azim, SNR]
+    // GSV mesajlarında veriler 4'lü paketler halinde gelir: [ID, Elev, Azim, SNR]
     for (int i = 4; i < cCount; i += 4) {
-      if (i + 2 < cCount) {
+      if (i + 3 < cCount) { // SNR verisini de alabilmek için index kontrolü arttırıldı
         int id = nmea.substring(commaIndex[i-1] + 1, commaIndex[i]).toInt();
         int elev = nmea.substring(commaIndex[i] + 1, commaIndex[i+1]).toInt();
         int azim = nmea.substring(commaIndex[i+1] + 1, commaIndex[i+2]).toInt();
+        int snr = nmea.substring(commaIndex[i+2] + 1, commaIndex[i+3]).toInt(); // SNR değeri okundu
         
         if (id > 0) {
-          SatData s = {id, sys, elev, azim};
+          SatData s = {id, sys, elev, azim, snr};
           activeSats.insert(s); // Kümeye Ekle
         }
       }
@@ -327,7 +377,7 @@ void loop() {
     sonGuncelleme = millis();
 
     if (ws.count() > 0) {
-      // ArduinoJson 7 ile uyumlu dinamik boyut. Büyük uydu dizileri için şart.
+      // ArduinoJson 7 ile uyumlu dinamik boyut. 
       JsonDocument doc; 
       
       // Konum Verileri
@@ -361,6 +411,7 @@ void loop() {
           obj["id"] = s.id;
           obj["e"] = s.elev;
           obj["a"] = s.azim;
+          obj["sn"] = s.snr; // SNR JSON'a eklendi
         }
       }
 
