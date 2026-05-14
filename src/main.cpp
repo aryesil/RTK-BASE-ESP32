@@ -23,27 +23,27 @@ TinyGPSPlus gps;
 #define TXD2 16
 #define GNSS_BAUD 115200 
 #define PPS_PIN 27
-// TCP RTCM Yayın Sunucusu
 #define RTCM_PORT 2101
 WiFiServer rtcmServer(RTCM_PORT);
 WiFiClient tcpClients[3]; 
 
-// --- BELLEK DOSTU UYDU VERİ YAPISI ---
+// --- ÇİFT BANT DESTEKLİ UYDU VERİ YAPISI ---
 struct SatData {
   int id;
   char sys[3]; 
   int elev;   
   int azim;   
   int snr;    
+  int sig; 
 };
 
-#define MAX_SATS 100
+#define MAX_SATS 120
 SatData activeSats[MAX_SATS];
 int activeSatCount = 0;
 
-void addSat(const char* sys, int id, int elev, int azim, int snr) {
+void addSat(const char* sys, int id, int elev, int azim, int snr, int sig) {
   for (int i = 0; i < activeSatCount; i++) {
-    if (strcmp(activeSats[i].sys, sys) == 0 && activeSats[i].id == id) {
+    if (strcmp(activeSats[i].sys, sys) == 0 && activeSats[i].id == id && activeSats[i].sig == sig) {
       activeSats[i].elev = elev; activeSats[i].azim = azim; activeSats[i].snr = snr;
       return;
     }
@@ -54,6 +54,7 @@ void addSat(const char* sys, int id, int elev, int azim, int snr) {
     activeSats[activeSatCount].elev = elev;
     activeSats[activeSatCount].azim = azim;
     activeSats[activeSatCount].snr = snr;
+    activeSats[activeSatCount].sig = sig; 
     activeSatCount++;
   }
 }
@@ -106,9 +107,13 @@ const char index_html[] PROGMEM = R"rawliteral(
         .value { font-size: 18px; color: #fff; font-weight: bold; }
         .alert { color: #ff3333; }
         .good { color: #33ff33; }
-        .sat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; text-align: center; margin-top: 10px;}
-        .sat-box { background: #2a2a2a; padding: 5px; border-radius: 5px; }
-        .sat-box span { display: block; font-size: 10px; color: #888; }
+        
+        .sat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px;}
+        .sat-box { background: #2a2a2a; padding: 6px; border-radius: 6px; display: flex; flex-direction: column; border: 1px solid #333;}
+        .sat-box-title { font-size: 12px; color: #aaa; border-bottom: 1px solid #444; padding-bottom: 3px; margin-bottom: 4px; font-weight: bold; text-align: center;}
+        .sat-sig-row { display: flex; justify-content: space-between; font-size: 11px; color: #888; padding: 2px 0;}
+        .sat-sig-row span.val { color: #00ffcc; font-weight: bold; }
+        
         #map { height: 250px; border-radius: 8px; margin-top: 10px; z-index: 1;}
         canvas { background: #1a1a1a; border-radius: 50%; display: block; margin: 0 auto; border: 2px solid #333;}
         #terminal { height: 110px; overflow-y: auto; background: #000; color: #00ffcc; padding: 8px; border: 1px solid #444; border-radius: 4px; font-size: 12px; margin-top: 5px; font-family: monospace; }
@@ -126,7 +131,6 @@ const char index_html[] PROGMEM = R"rawliteral(
             <div>HDOP: <span id="hdop" class="value">0.0</span></div>
             <hr style="border: 0; border-top: 1px solid #444; margin: 10px 0;">
             <div>PPS Durumu: <span id="pps_status" class="value alert">KİLİT YOK</span></div>
-            <div>PPS Sayacı: <span id="pps_count" class="value">0</span></div>
             <div>Uydu Saati (UTC): <span id="sat_time" class="value" style="color:#aaffaa">--:--:--</span></div>
             <div>RTCM3 Akışı: <span id="rtcm" class="value">0</span> pkt/sn</div>
             <div>TCP Yayın (Port 2101): <span id="tcp_clients" class="value" style="color:#00ffcc">0</span> İstemci</div>
@@ -141,17 +145,39 @@ const char index_html[] PROGMEM = R"rawliteral(
         </div>
 
         <div class="card">
-            <h3>🛰️ UYDU DAĞILIMI (Fiziksel Toplam: <span id="total_sats">0</span>)</h3>
+            <h3>🛰️ AKTİF SİNYAL DAĞILIMI (Toplam: <span id="total_sats">0</span> Sinyal)</h3>
             <div class="sat-grid">
-                <div class="sat-box"><span>GPS</span><div id="s-gps" class="value">0</div></div>
-                <div class="sat-box"><span>GLO</span><div id="s-glo" class="value">0</div></div>
-                <div class="sat-box"><span>GAL</span><div id="s-gal" class="value">0</div></div>
-                <div class="sat-box"><span>BDS</span><div id="s-bei" class="value">0</div></div>
-                <div class="sat-box"><span>NAV</span><div id="s-nav" class="value">0</div></div>
-                <div class="sat-box"><span>QZS</span><div id="s-qzs" class="value">0</div></div>
+                <div class="sat-box">
+                    <div class="sat-box-title">GPS</div>
+                    <div class="sat-sig-row"><span>L1 C/A:</span><span class="val" id="gps-l1">0</span></div>
+                    <div class="sat-sig-row"><span>L5:</span><span class="val" id="gps-l5">0</span></div>
+                </div>
+                <div class="sat-box">
+                    <div class="sat-box-title">GLONASS</div>
+                    <div class="sat-sig-row"><span>L1/G1:</span><span class="val" id="glo-l1">0</span></div>
+                </div>
+                <div class="sat-box">
+                    <div class="sat-box-title">GALILEO</div>
+                    <div class="sat-sig-row"><span>E1:</span><span class="val" id="gal-e1">0</span></div>
+                    <div class="sat-sig-row"><span>E5a:</span><span class="val" id="gal-e5a">0</span></div>
+                </div>
+                <div class="sat-box">
+                    <div class="sat-box-title">BDS</div>
+                    <div class="sat-sig-row"><span>B1I:</span><span class="val" id="bei-b1">0</span></div>
+                    <div class="sat-sig-row"><span>B2a:</span><span class="val" id="bei-b2a">0</span></div>
+                </div>
+                <div class="sat-box">
+                    <div class="sat-box-title">QZSS</div>
+                    <div class="sat-sig-row"><span>L1 C/A:</span><span class="val" id="qzs-l1">0</span></div>
+                    <div class="sat-sig-row"><span>L5:</span><span class="val" id="qzs-l5">0</span></div>
+                </div>
+                <div class="sat-box">
+                    <div class="sat-box-title">NAVIC</div>
+                    <div class="sat-sig-row"><span>L5:</span><span class="val" id="nav-l5">0</span></div>
+                </div>
             </div>
             <h3 style="margin-top: 15px;">🌌 SKYVIEW (Canlı Radar)</h3>
-            <canvas id="skyview" width="600" height="600"></canvas>
+            <canvas id="skyview" width="500" height="500"></canvas>
         </div>
     </div>
 
@@ -237,7 +263,6 @@ const char index_html[] PROGMEM = R"rawliteral(
         }
         document.getElementById("cmdInput").addEventListener("keyup", function(event) { if (event.key === "Enter") sendCommand(); });
 
-        // --- YENİ SAATLİ TERMİNAL LOGLAYICI ---
         function logTerminal(msg) {
             var term = document.getElementById('terminal');
             var timeStr = new Date().toLocaleTimeString('tr-TR', { hour12: false });
@@ -248,7 +273,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         function onMessage(event) {
             if (typeof event.data === "string" && event.data.startsWith("TERM:")) {
                 let msg = event.data.substring(5); 
-                logTerminal("<span style='color:#fff; font-weight:bold;'>RX:</span> <span style='color:#FF0000;'>" + msg + "</span>");
+                logTerminal("<span style='color:#ff3333; font-weight:bold;'>RX:</span> <span style='color:#fff;'>" + msg + "</span>");
                 return; 
             }
             var data;
@@ -261,9 +286,6 @@ const char index_html[] PROGMEM = R"rawliteral(
                 document.getElementById('hdop').innerText = data.hdop.toFixed(2);
                 document.getElementById('rtcm').innerText = data.rtcm; 
                 document.getElementById('tcp_clients').innerText = data.tcp_clients;
-                document.getElementById('pps_count').innerText = data.pps_count;
-                
-                // YENİ: UYDU SAATİ GÜNCELLEMESİ
                 if(data.sat_time) document.getElementById('sat_time').innerText = data.sat_time;
                 
                 var ppsEl = document.getElementById('pps_status');
@@ -273,13 +295,19 @@ const char index_html[] PROGMEM = R"rawliteral(
                     ppsEl.innerText = "BEKLENİYOR..."; ppsEl.className = "value alert";
                 }
 
-                document.getElementById('s-gps').innerText = data.sats.gps; 
-                document.getElementById('s-glo').innerText = data.sats.glo;
-                document.getElementById('s-gal').innerText = data.sats.gal; 
-                document.getElementById('s-bei').innerText = data.sats.bei;
-                document.getElementById('s-nav').innerText = data.sats.nav; 
-                document.getElementById('s-qzs').innerText = data.sats.qzs;
-                document.getElementById('total_sats').innerText = data.sats.gps + data.sats.glo + data.sats.gal + data.sats.bei + data.sats.nav + data.sats.qzs;
+                let t = data.sats;
+                document.getElementById('gps-l1').innerText = t.gps.L1;
+                document.getElementById('gps-l5').innerText = t.gps.L5;
+                document.getElementById('glo-l1').innerText = t.glo.L1;
+                document.getElementById('gal-e1').innerText = t.gal.E1;
+                document.getElementById('gal-e5a').innerText = t.gal.E5a;
+                document.getElementById('bei-b1').innerText = t.bei.B1;
+                document.getElementById('bei-b2a').innerText = t.bei.B2a;
+                document.getElementById('qzs-l1').innerText = t.qzs.L1;
+                document.getElementById('qzs-l5').innerText = t.qzs.L5;
+                document.getElementById('nav-l5').innerText = t.nav.L5;
+                
+                document.getElementById('total_sats').innerText = t.gps.L1 + t.gps.L5 + t.glo.L1 + t.gal.E1 + t.gal.E5a + t.bei.B1 + t.bei.B2a + t.qzs.L1 + t.qzs.L5 + t.nav.L5;
               
                 if(data.lat !== 0.0 && data.lon !== 0.0) {
                     var newLatLng = new L.LatLng(data.lat, data.lon); marker.setLatLng(newLatLng);
@@ -333,6 +361,7 @@ bool isChecksumValid(const char* sentence) {
   return (calculatedCS == providedCS); 
 }
 
+// --- DÜZELTİLMİŞ GSV PARSER (NMEA 4.10) ---
 void uyduTipleriniAyristir(String nmea) {
   if (nmea.indexOf("GSV") != -1) {
     const char* sys = "UN";
@@ -343,24 +372,45 @@ void uyduTipleriniAyristir(String nmea) {
     else if (nmea.startsWith("$GI")) sys = "GI";
     else if (nmea.startsWith("$GQ")) sys = "GQ";
 
-    int commaIndex[20];
+    int commaIndex[25]; // Kapasiteyi artırdık
     int cCount = 0;
     for (int i = 0; i < nmea.length(); i++) {
       if (nmea[i] == ',') {
         commaIndex[cCount++] = i;
-        if (cCount >= 20) break;
+        if (cCount >= 25) break;
+      }
+    }
+
+    int starIdx = nmea.indexOf('*');
+    if (starIdx < 0) return;
+
+    // Sinyal Kimliğini Güvenli Şekilde Tespit Etme
+    bool hasSignalId = false;
+    int sig_id = 1; 
+    if (cCount >= 4) {
+      if ((cCount - 3) % 4 == 1) { // Eğer 4. uydu SNR'sından sonra bir alan daha varsa (Sinyal ID)
+        hasSignalId = true;
+        String sigStr = nmea.substring(commaIndex[cCount - 1] + 1, starIdx);
+        if (sigStr.length() > 0) sig_id = strtol(sigStr.c_str(), NULL, 16);
       }
     }
 
     for (int i = 4; i < cCount; i += 4) {
-      if (i + 3 < cCount) { 
+      if (i + 2 < cCount) {
         int id = nmea.substring(commaIndex[i-1] + 1, commaIndex[i]).toInt();
         int elev = nmea.substring(commaIndex[i] + 1, commaIndex[i+1]).toInt();
         int azim = nmea.substring(commaIndex[i+1] + 1, commaIndex[i+2]).toInt();
-        int snr = nmea.substring(commaIndex[i+2] + 1, commaIndex[i+3]).toInt(); 
+        int snr = 0;
+        
+        if (i + 3 < cCount) {
+          snr = nmea.substring(commaIndex[i+2] + 1, commaIndex[i+3]).toInt();
+        } else if (!hasSignalId) {
+          // NMEA 4.0'da (Signal ID yokken) son uydunun SNR'sini kaçırmamak için DÜZELTİLDİ
+          snr = nmea.substring(commaIndex[i+2] + 1, starIdx).toInt();
+        }
         
         if (id > 0) {
-          addSat(sys, id, elev, azim, snr); 
+          addSat(sys, id, elev, azim, snr, sig_id); 
         }
       }
     }
@@ -509,10 +559,6 @@ void loop() {
       doc["tcp_clients"] = activeTcp;
 
       doc["rtcm"] = rtcmPaketSayaci;
-      doc["pps_count"] = ppsSayaci;
-      doc["pps_active"] = (micros() - sonPpsZamaniMicros < 2000000) ? true : false; 
-
-      // YENİ: UYDU SAATİNİ JSON'A EKLEME
       if (gps.time.isValid()) {
         char tBuf[12];
         sprintf(tBuf, "%02d:%02d:%02d", gps.time.hour(), gps.time.minute(), gps.time.second());
@@ -520,32 +566,45 @@ void loop() {
       } else {
         doc["sat_time"] = "--:--:--";
       }
+      doc["pps_active"] = (micros() - sonPpsZamaniMicros < 2000000) ? true : false; 
 
-      int sGPS=0, sGLO=0, sGAL=0, sBEI=0, sNAV=0, sQZS=0;
+      int gpsL1=0, gpsL5=0, gloL1=0, galE1=0, galE5a=0, beiB1=0, beiB2a=0, qzsL1=0, qzsL5=0, navL5=0;
       JsonArray sky = doc["sky"].to<JsonArray>();
       
       for (int i = 0; i < activeSatCount; i++) {
         SatData s = activeSats[i];
-        if(strcmp(s.sys, "GP") == 0) sGPS++;
-        else if(strcmp(s.sys, "GL") == 0) sGLO++;
-        else if(strcmp(s.sys, "GA") == 0) sGAL++;
-        else if(strcmp(s.sys, "GB") == 0) sBEI++;
-        else if(strcmp(s.sys, "GI") == 0) sNAV++;
-        else if(strcmp(s.sys, "GQ") == 0) sQZS++;
+        
+        if(strcmp(s.sys, "GP") == 0) { if(s.sig == 8) gpsL5++; else gpsL1++; }
+        else if(strcmp(s.sys, "GL") == 0) { gloL1++; }
+        else if(strcmp(s.sys, "GA") == 0) { if(s.sig == 1 || s.sig == 2 || s.sig == 3) galE5a++; else galE1++; }
+        
+        // İŞTE SENİN BEİDOU B2a DÜZELTMESİ BURADA! (5, 6, 7 ve 0xB NMEA'da B2 frekanslarına denk gelir)
+        else if(strcmp(s.sys, "GB") == 0) { if(s.sig == 5 || s.sig == 6 || s.sig == 7 || s.sig == 0xB || s.sig == 0xC) beiB2a++; else beiB1++; }
+        
+        else if(strcmp(s.sys, "GQ") == 0) { if(s.sig == 8) qzsL5++; else qzsL1++; }
+        else if(strcmp(s.sys, "GI") == 0) { navL5++; }
         
         if(s.elev > 0 || s.azim > 0) {
-          JsonObject obj = sky.add<JsonObject>();
-          obj["s"] = s.sys;
-          obj["id"] = s.id;
-          obj["e"] = s.elev;
-          obj["a"] = s.azim;
-          obj["sn"] = s.snr; 
+          // RADAR OPTİMİZASYONU: Sadece birincil sinyali (L1, E1, B1I) çiz. 
+          bool isPrimary = true;
+          if((strcmp(s.sys, "GP") == 0 || strcmp(s.sys, "GQ") == 0) && s.sig == 8) isPrimary = false;
+          if(strcmp(s.sys, "GA") == 0 && (s.sig == 1 || s.sig == 2 || s.sig == 3)) isPrimary = false;
+          if(strcmp(s.sys, "GB") == 0 && (s.sig == 5 || s.sig == 6 || s.sig == 7 || s.sig == 0xB || s.sig == 0xC)) isPrimary = false;
+
+          if (isPrimary) {
+            JsonObject obj = sky.add<JsonObject>();
+            obj["s"] = s.sys; obj["id"] = s.id; obj["e"] = s.elev; obj["a"] = s.azim; obj["sn"] = s.snr; 
+          }
         }
       }
 
       JsonObject sats = doc["sats"].to<JsonObject>();
-      sats["gps"] = sGPS; sats["glo"] = sGLO; sats["gal"] = sGAL;
-      sats["bei"] = sBEI; sats["nav"] = sNAV; sats["qzs"] = sQZS;
+      JsonObject s_gps = sats["gps"].to<JsonObject>(); s_gps["L1"] = gpsL1; s_gps["L5"] = gpsL5;
+      JsonObject s_glo = sats["glo"].to<JsonObject>(); s_glo["L1"] = gloL1;
+      JsonObject s_gal = sats["gal"].to<JsonObject>(); s_gal["E1"] = galE1; s_gal["E5a"] = galE5a;
+      JsonObject s_bei = sats["bei"].to<JsonObject>(); s_bei["B1"] = beiB1; s_bei["B2a"] = beiB2a;
+      JsonObject s_qzs = sats["qzs"].to<JsonObject>(); s_qzs["L1"] = qzsL1; s_qzs["L5"] = qzsL5;
+      JsonObject s_nav = sats["nav"].to<JsonObject>(); s_nav["L5"] = navL5;
 
       String jsonString;
       serializeJson(doc, jsonString);
