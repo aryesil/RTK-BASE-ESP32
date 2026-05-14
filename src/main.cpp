@@ -29,7 +29,7 @@ TinyGPSPlus gps;
 WiFiServer rtcmServer(RTCM_PORT);
 WiFiClient tcpClients[3]; // Aynı anda 3 istemciye kadar hizmet verebilecek şekilde dizi
 
-// --- YENİ: Kapsamlı Uydu Veri Yapısı (ID, Tip, Elevasyon, Azimut, SNR) ---
+// --- Kapsamlı Uydu Veri Yapısı (ID, Tip, Elevasyon, Azimut, SNR) ---
 struct SatData {
   int id;
   String sys; 
@@ -53,7 +53,6 @@ volatile unsigned long ppsSayaci = 0;
 volatile unsigned long sonPpsZamani = 0;
 unsigned long sonGuncelleme = 0;
 String nmeaTampon = "";
-String pendingTerminalMsg = ""; // YENİ: Web'e gitmeyi bekleyen terminal cevapları kuyruğu
 
 // --- PPS KESME FONKSİYONU ---
 void IRAM_ATTR ppsKesmesi() {
@@ -305,24 +304,21 @@ const char index_html[] PROGMEM = R"rawliteral(
         }
 
         function onMessage(event) {
+            // ==============================================================
+            // YENİ VE %100 GÜVENLİ: JSON'DAN BAĞIMSIZ HAM METİN YAKALAYICI
+            // Eğer gelen mesaj "TERM:" ile başlıyorsa, json parse etmeden direkt yazdır!
+            // ==============================================================
+            if (typeof event.data === "string" && event.data.startsWith("TERM:")) {
+                let msg = event.data.substring(5); // "TERM:" kısmını kes
+                logTerminal("<span style='color:#ff3333; font-weight:bold;'>RX:</span> <span style='color:#fff;'>" + msg + "</span>");
+                return; // JSON'a hiç bulaşmadan fonksiyondan çık
+            }
+
             var data;
-            // JSON parse hatasını engellemek için güvenlik çemberi
             try { 
                 data = JSON.parse(event.data); 
             } catch(e) { 
-                return; 
-            }
-
-            // --- YENİ: KUYRUKTAN GELEN RX YANITLARINI (KIRMIZI) TERMİNALE BAS ---
-            if (data.term) {
-                // || ayracına göre böl (aynı saniyede birden fazla cevap geldiyse)
-                let messages = data.term.split("||");
-                messages.forEach(msg => {
-                    if(msg.trim() !== "") {
-                        logTerminal("<span style='color:#ff3333; font-weight:bold;'>RX:</span> <span style='color:#fff;'>" + msg + "</span>");
-                    }
-                });
-                // DİKKAT: Artık "return" yok! Çünkü bu paketin içinde konum verileri de gelmeye devam ediyor.
+                return; // JSON hatası varsa sessizce çık
             }
 
             // Sadece konum/sistem verisi barındıran paketleri haritaya ve UI'a yansıt
@@ -512,6 +508,17 @@ void loop() {
         // Satır tamamlandı. Boşlukları ve \r'yi temizle.
         nmeaTampon.trim(); 
         
+        // TİTANYUM FİLTRE
+        String temizCevap = "";
+        for (int k = 0; k < nmeaTampon.length(); k++) {
+          char c = nmeaTampon[k];
+          // Sadece harfler, rakamlar ve standart noktalama işaretleri
+          if (isalnum(c) || c == '$' || c == ',' || c == '.' || c == '*' || c == '-' || c == '_' || c == ' ' || c == ':') {
+            temizCevap += c;
+          }
+        }
+        nmeaTampon = temizCevap; // %100 temizlenmiş metin
+        
         if (nmeaTampon.length() > 0) {
           // Eğer $ ile başlıyorsa TinyGPS harici kendi uydu radarımız için de ayrıştır
           if (nmeaTampon.startsWith("$")) {
@@ -519,7 +526,7 @@ void loop() {
           }
           
           // KARA LİSTE (BLACKLIST) FİLTRESİ
-          // Standart, saniyede 10 kez akan konum verileri DEĞİLSE bu bir cevaptır!
+          // Standart konum verileri DEĞİLSE bu bir cevaptır!
           if (!nmeaTampon.startsWith("$GN") && 
               !nmeaTampon.startsWith("$GP") && 
               !nmeaTampon.startsWith("$GL") && 
@@ -530,14 +537,16 @@ void loop() {
             
             Serial.println("[MODUL CEVABI]: " + nmeaTampon);
             
-            // Cevabı hemen fırlatma! Bekleme kuyruğuna ekle ("||" ayracı ile)
-            if (pendingTerminalMsg.length() > 0) pendingTerminalMsg += "||";
-            pendingTerminalMsg += nmeaTampon;
+            // ==============================================================
+            // YENİ: JSON İLE UĞRAŞMADAN ANINDA HAM METİN OLARAK FIRLAT!
+            // Tarayıcı bunu görüp anında kırmızı RX olarak ekrana basacak.
+            // ==============================================================
+            ws.textAll("TERM:" + nmeaTampon);
           }
         }
         nmeaTampon = ""; // Tamponu sıfırla
       } else if (b >= 32 && b <= 126) {
-        // ÇELİK YELEK: Sadece okunabilir karakterleri al (RTCM 0xD3 gürültüsünü engeller)
+        // Sadece okunabilir karakterleri al (RTCM gürültüsünü engeller)
         if (nmeaTampon.length() < 120) {
           nmeaTampon += (char)b;
         }
@@ -566,12 +575,6 @@ void loop() {
       doc["rtcm"] = rtcmPaketSayaci;
       doc["pps_count"] = ppsSayaci;
       doc["pps_active"] = (millis() - sonPpsZamani < 2000) ? true : false;
-
-      // --- YENİ: EĞER KUYRUKTA BEKLEYEN TERMİNAL MESAJI VARSA PAKETE EKLE ---
-      if (pendingTerminalMsg.length() > 0) {
-        doc["term"] = pendingTerminalMsg;
-        pendingTerminalMsg = ""; // Gönderilmek üzere pakete eklendi, kuyruğu boşalt.
-      }
 
       int sGPS=0, sGLO=0, sGAL=0, sBEI=0, sNAV=0, sQZS=0;
       JsonArray sky = doc["sky"].to<JsonArray>();
