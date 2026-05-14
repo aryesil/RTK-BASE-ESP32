@@ -28,7 +28,7 @@ TinyGPSPlus gps;
 WiFiServer rtcmServer(RTCM_PORT);
 WiFiClient tcpClients[3]; 
 
-// --- BELLEK DOSTU UYDU VERİ YAPISI (std::set YERİNE) ---
+// --- BELLEK DOSTU UYDU VERİ YAPISI ---
 struct SatData {
   int id;
   char sys[3]; 
@@ -41,7 +41,6 @@ struct SatData {
 SatData activeSats[MAX_SATS];
 int activeSatCount = 0;
 
-// Yeni uyduyu listeye ekleyen veya güncelleyen fonksiyon
 void addSat(const char* sys, int id, int elev, int azim, int snr) {
   for (int i = 0; i < activeSatCount; i++) {
     if (strcmp(activeSats[i].sys, sys) == 0 && activeSats[i].id == id) {
@@ -59,7 +58,6 @@ void addSat(const char* sys, int id, int elev, int azim, int snr) {
   }
 }
 
-// Sayaçlar ve Bellek Dostu Tamponlar (String yerine Char Array)
 volatile uint32_t rtcmPaketSayaci = 0;
 volatile uint32_t ppsSayaci = 0;
 volatile uint32_t sonPpsZamaniMicros = 0; 
@@ -68,13 +66,11 @@ uint32_t sonGuncelleme = 0;
 char nmeaBuff[128];
 int nmeaIdx = 0;
 
-// --- PPS KESME FONKSİYONU ---
 void IRAM_ATTR ppsKesmesi() {
   ppsSayaci++;
   sonPpsZamaniMicros = micros(); 
 }
 
-// --- WEBSOCKET GELEN MESAJ YAKALAYICI ---
 void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
   if (type == WS_EVT_DATA) {
     AwsFrameInfo *info = (AwsFrameInfo*)arg;
@@ -131,6 +127,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             <hr style="border: 0; border-top: 1px solid #444; margin: 10px 0;">
             <div>PPS Durumu: <span id="pps_status" class="value alert">KİLİT YOK</span></div>
             <div>PPS Sayacı: <span id="pps_count" class="value">0</span></div>
+            <div>Uydu Saati (UTC): <span id="sat_time" class="value" style="color:#aaffaa">--:--:--</span></div>
             <div>RTCM3 Akışı: <span id="rtcm" class="value">0</span> pkt/sn</div>
             <div>TCP Yayın (Port 2101): <span id="tcp_clients" class="value" style="color:#00ffcc">0</span> İstemci</div>
             <div id="map"></div>
@@ -154,7 +151,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <div class="sat-box"><span>QZS</span><div id="s-qzs" class="value">0</div></div>
             </div>
             <h3 style="margin-top: 15px;">🌌 SKYVIEW (Canlı Radar)</h3>
-            <canvas id="skyview" width="500" height="500"></canvas>
+            <canvas id="skyview" width="600" height="600"></canvas>
         </div>
     </div>
 
@@ -240,9 +237,11 @@ const char index_html[] PROGMEM = R"rawliteral(
         }
         document.getElementById("cmdInput").addEventListener("keyup", function(event) { if (event.key === "Enter") sendCommand(); });
 
+        // --- YENİ SAATLİ TERMİNAL LOGLAYICI ---
         function logTerminal(msg) {
             var term = document.getElementById('terminal');
-            term.innerHTML += "<div class='term-line'>" + msg + "</div>";
+            var timeStr = new Date().toLocaleTimeString('tr-TR', { hour12: false });
+            term.innerHTML += "<div class='term-line'><span style='color:#888; font-size:10px;'>[" + timeStr + "]</span> " + msg + "</div>";
             term.scrollTop = term.scrollHeight; 
         }
 
@@ -256,10 +255,16 @@ const char index_html[] PROGMEM = R"rawliteral(
             try { data = JSON.parse(event.data); } catch(e) { return; }
 
             if (data.lat !== undefined) {
-                document.getElementById('lat').innerText = data.lat.toFixed(6); document.getElementById('lon').innerText = data.lon.toFixed(6);
-                document.getElementById('alt').innerText = data.alt.toFixed(2); document.getElementById('hdop').innerText = data.hdop.toFixed(2);
-                document.getElementById('rtcm').innerText = data.rtcm; document.getElementById('tcp_clients').innerText = data.tcp_clients;
+                document.getElementById('lat').innerText = data.lat.toFixed(6); 
+                document.getElementById('lon').innerText = data.lon.toFixed(6);
+                document.getElementById('alt').innerText = data.alt.toFixed(2); 
+                document.getElementById('hdop').innerText = data.hdop.toFixed(2);
+                document.getElementById('rtcm').innerText = data.rtcm; 
+                document.getElementById('tcp_clients').innerText = data.tcp_clients;
                 document.getElementById('pps_count').innerText = data.pps_count;
+                
+                // YENİ: UYDU SAATİ GÜNCELLEMESİ
+                if(data.sat_time) document.getElementById('sat_time').innerText = data.sat_time;
                 
                 var ppsEl = document.getElementById('pps_status');
                 if(data.pps_active) {
@@ -268,9 +273,12 @@ const char index_html[] PROGMEM = R"rawliteral(
                     ppsEl.innerText = "BEKLENİYOR..."; ppsEl.className = "value alert";
                 }
 
-                document.getElementById('s-gps').innerText = data.sats.gps; document.getElementById('s-glo').innerText = data.sats.glo;
-                document.getElementById('s-gal').innerText = data.sats.gal; document.getElementById('s-bei').innerText = data.sats.bei;
-                document.getElementById('s-nav').innerText = data.sats.nav; document.getElementById('s-qzs').innerText = data.sats.qzs;
+                document.getElementById('s-gps').innerText = data.sats.gps; 
+                document.getElementById('s-glo').innerText = data.sats.glo;
+                document.getElementById('s-gal').innerText = data.sats.gal; 
+                document.getElementById('s-bei').innerText = data.sats.bei;
+                document.getElementById('s-nav').innerText = data.sats.nav; 
+                document.getElementById('s-qzs').innerText = data.sats.qzs;
                 document.getElementById('total_sats').innerText = data.sats.gps + data.sats.glo + data.sats.gal + data.sats.bei + data.sats.nav + data.sats.qzs;
               
                 if(data.lat !== 0.0 && data.lon !== 0.0) {
@@ -290,13 +298,10 @@ const char index_html[] PROGMEM = R"rawliteral(
 // 4. NMEA AYRIŞTIRICI & GÜVENLİK
 // ==========================================
 
-// --- GÜVENLİK DUVARI: NMEA CHECKSUM DOĞRULAYICI (KURŞUN GEÇİRMEZ) ---
 bool isChecksumValid(const char* sentence) {
   int len = strlen(sentence);
-  // Gerçek bir NMEA komutu bu kadar kısa olamaz (Örn: en az $GPGGA*XX)
   if (len < 8) return false; 
   
-  // Yıldız (*) işaretinin yerini bul
   int starIndex = -1;
   for (int i = 0; i < len; i++) {
     if (sentence[i] == '*') {
@@ -305,25 +310,18 @@ bool isChecksumValid(const char* sentence) {
     }
   }
   
-  // Yıldız yoksa veya yıldızdan sonra en az 2 karakter yoksa ÇÖP!
   if (starIndex == -1 || starIndex > len - 3) return false;
 
-  // =======================================================
-  // KATI KONTROL: Yıldızdan sonraki 2 karakter HEX (0-9, A-F) mi?
-  // =======================================================
   char c1 = sentence[starIndex + 1];
   char c2 = sentence[starIndex + 2];
-  if (!isxdigit(c1) || !isxdigit(c2)) return false; // Hex değilse anında reddet!
+  if (!isxdigit(c1) || !isxdigit(c2)) return false; 
   
-  // Sadece A-Z, a-z, 0-9 ve standart noktalama işaretleri içerebilir.
-  // RTCM içindeki garip ASCII sembollerini ( }, { vb.) engeller.
   for (int i = 1; i < starIndex; i++) {
     if (sentence[i] < 32 || sentence[i] > 126 || sentence[i] == '{' || sentence[i] == '}' || sentence[i] == '`') {
         return false;
     }
   }
 
-  // Her şey mükemmelse XOR hesabını yap
   uint8_t calculatedCS = 0;
   for (int i = 1; i < starIndex; i++) {
     calculatedCS ^= sentence[i];
@@ -423,7 +421,6 @@ void setup() {
 void loop() {
   ws.cleanupClients(); 
   
-  // --- TCP İstemci Bağlantı Kontrolü (While ile Çoklu Bağlantı Desteği) ---
   while (rtcmServer.hasClient()) {
     bool added = false;
     for (int i = 0; i < 3; i++) {
@@ -437,21 +434,18 @@ void loop() {
     if (!added) rtcmServer.available().stop(); 
   }
 
-  // --- UART Veri Okuma (BELLEK DOSTU CHAR BUFFER MİMARİSİ) ---
   size_t bytesAvailable = Serial2.available();
   if (bytesAvailable > 0) {
     uint8_t buf[128]; 
     if (bytesAvailable > sizeof(buf)) bytesAvailable = sizeof(buf);
     size_t len = Serial2.read(buf, bytesAvailable);
 
-    // A) Veriyi TCP İstemcilerine Fırlat
     for (int i = 0; i < 3; i++) {
       if (tcpClients[i] && tcpClients[i].connected()) {
         tcpClients[i].write(buf, len);
       }
     }
 
-    // B) Kendi Sistemimiz İçin Veriyi Ayrıştır
     for (size_t i = 0; i < len; i++) {
       uint8_t b = buf[i];
       gps.encode(b); 
@@ -464,22 +458,17 @@ void loop() {
         nmeaBuff[nmeaIdx++] = c;
       } else if (c == '\n') {
         if (nmeaIdx > 0 && nmeaBuff[0] == '$') {
-          // Satır sonundaki gizli \r karakterini temizle
           if (nmeaBuff[nmeaIdx - 1] == '\r') {
             nmeaBuff[nmeaIdx - 1] = '\0';
           } else {
             nmeaBuff[nmeaIdx] = '\0'; 
           }
           
-          // ==========================================================
-          // GÜVENLİK KAPISI: EĞER MATEMATİK TUTMUYORSA RTCM GÜRÜLTÜSÜDÜR!
-          // ==========================================================
           if (isChecksumValid(nmeaBuff)) {
             String gecerliCevap = String(nmeaBuff); 
             
             uyduTipleriniAyristir(gecerliCevap); 
             
-            // KARA LİSTE FİLTRESİ
             if (!gecerliCevap.startsWith("$GN") && 
                 !gecerliCevap.startsWith("$GP") && 
                 !gecerliCevap.startsWith("$GL") && 
@@ -502,7 +491,6 @@ void loop() {
     }
   }
 
-  // --- Her 1 Saniyede Bir Web Arayüzüne Genel Veri Yolla ---
   if (millis() - sonGuncelleme >= 1000) {
     sonGuncelleme = millis();
 
@@ -522,8 +510,16 @@ void loop() {
 
       doc["rtcm"] = rtcmPaketSayaci;
       doc["pps_count"] = ppsSayaci;
-      // millis() yerine micros() üzerinden 2 saniyelik (2.000.000 mikrosaniye) fark kontrolü
       doc["pps_active"] = (micros() - sonPpsZamaniMicros < 2000000) ? true : false; 
+
+      // YENİ: UYDU SAATİNİ JSON'A EKLEME
+      if (gps.time.isValid()) {
+        char tBuf[12];
+        sprintf(tBuf, "%02d:%02d:%02d", gps.time.hour(), gps.time.minute(), gps.time.second());
+        doc["sat_time"] = String(tBuf);
+      } else {
+        doc["sat_time"] = "--:--:--";
+      }
 
       int sGPS=0, sGLO=0, sGAL=0, sBEI=0, sNAV=0, sQZS=0;
       JsonArray sky = doc["sky"].to<JsonArray>();
@@ -557,6 +553,6 @@ void loop() {
     }
 
     rtcmPaketSayaci = 0;
-    activeSatCount = 0; // Diziyi her saniye baştan yazmak için sayacı sıfırla
+    activeSatCount = 0; 
   }
 }
