@@ -290,11 +290,13 @@ const char index_html[] PROGMEM = R"rawliteral(
 // 4. NMEA AYRIŞTIRICI & GÜVENLİK
 // ==========================================
 
-// --- GÜVENLİK DUVARI: NMEA CHECKSUM DOĞRULAYICI ---
+// --- GÜVENLİK DUVARI: NMEA CHECKSUM DOĞRULAYICI (KURŞUN GEÇİRMEZ) ---
 bool isChecksumValid(const char* sentence) {
   int len = strlen(sentence);
-  if (len < 5) return false; 
+  // Gerçek bir NMEA komutu bu kadar kısa olamaz (Örn: en az $GPGGA*XX)
+  if (len < 8) return false; 
   
+  // Yıldız (*) işaretinin yerini bul
   int starIndex = -1;
   for (int i = 0; i < len; i++) {
     if (sentence[i] == '*') {
@@ -303,14 +305,31 @@ bool isChecksumValid(const char* sentence) {
     }
   }
   
+  // Yıldız yoksa veya yıldızdan sonra en az 2 karakter yoksa ÇÖP!
   if (starIndex == -1 || starIndex > len - 3) return false;
+
+  // =======================================================
+  // KATI KONTROL: Yıldızdan sonraki 2 karakter HEX (0-9, A-F) mi?
+  // =======================================================
+  char c1 = sentence[starIndex + 1];
+  char c2 = sentence[starIndex + 2];
+  if (!isxdigit(c1) || !isxdigit(c2)) return false; // Hex değilse anında reddet!
   
+  // Sadece A-Z, a-z, 0-9 ve standart noktalama işaretleri içerebilir.
+  // RTCM içindeki garip ASCII sembollerini ( }, { vb.) engeller.
+  for (int i = 1; i < starIndex; i++) {
+    if (sentence[i] < 32 || sentence[i] > 126 || sentence[i] == '{' || sentence[i] == '}' || sentence[i] == '`') {
+        return false;
+    }
+  }
+
+  // Her şey mükemmelse XOR hesabını yap
   uint8_t calculatedCS = 0;
   for (int i = 1; i < starIndex; i++) {
     calculatedCS ^= sentence[i];
   }
   
-  char hexStr[3] = {sentence[starIndex + 1], sentence[starIndex + 2], '\0'};
+  char hexStr[3] = {c1, c2, '\0'};
   uint8_t providedCS = (uint8_t)strtol(hexStr, NULL, 16);
   
   return (calculatedCS == providedCS); 
