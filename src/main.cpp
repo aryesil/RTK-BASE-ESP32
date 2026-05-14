@@ -4,13 +4,12 @@
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include <TinyGPS++.h>
-#include <set>
 
 // ==========================================
 // 1. KULLANICI AYARLARI 
 // ==========================================
-const char* ssid = "IHA_MARMARA_TEST";
-const char* password = "HezarfenCelebi2023";
+const char* ssid = "Arda";
+const char* password = "ozurlubaskan";
 
 // ==========================================
 // 2. DONANIM VE NESNE TANIMLAMALARI
@@ -27,37 +26,52 @@ TinyGPSPlus gps;
 // TCP RTCM Yayın Sunucusu
 #define RTCM_PORT 2101
 WiFiServer rtcmServer(RTCM_PORT);
-WiFiClient tcpClients[3]; // Aynı anda 3 istemciye kadar hizmet verebilecek şekilde dizi
+WiFiClient tcpClients[3]; 
 
-// --- Kapsamlı Uydu Veri Yapısı (ID, Tip, Elevasyon, Azimut, SNR) ---
+// --- BELLEK DOSTU UYDU VERİ YAPISI (std::set YERİNE) ---
 struct SatData {
   int id;
-  String sys; 
+  char sys[3]; 
   int elev;   
   int azim;   
-  int snr;    // Sinyal Gücü (Glow efekti için)
-  
-  // Set içinde mükerrer uyduları engellemek için kimlik kuralı
-  bool operator<(const SatData& other) const {
-    if (sys != other.sys) return sys < other.sys;
-    return id < other.id;
-  }
+  int snr;    
 };
 
-// Tüm aktif uyduları açılarıyla beraber tutacağımız tek havuz
-std::set<SatData> activeSats;
+#define MAX_SATS 100
+SatData activeSats[MAX_SATS];
+int activeSatCount = 0;
 
-// Sayaçlar
-int rtcmPaketSayaci = 0;
-volatile unsigned long ppsSayaci = 0;
-volatile unsigned long sonPpsZamani = 0;
-unsigned long sonGuncelleme = 0;
-String nmeaTampon = "";
+// Yeni uyduyu listeye ekleyen veya güncelleyen fonksiyon
+void addSat(const char* sys, int id, int elev, int azim, int snr) {
+  for (int i = 0; i < activeSatCount; i++) {
+    if (strcmp(activeSats[i].sys, sys) == 0 && activeSats[i].id == id) {
+      activeSats[i].elev = elev; activeSats[i].azim = azim; activeSats[i].snr = snr;
+      return;
+    }
+  }
+  if (activeSatCount < MAX_SATS) {
+    activeSats[activeSatCount].id = id;
+    strcpy(activeSats[activeSatCount].sys, sys);
+    activeSats[activeSatCount].elev = elev;
+    activeSats[activeSatCount].azim = azim;
+    activeSats[activeSatCount].snr = snr;
+    activeSatCount++;
+  }
+}
+
+// Sayaçlar ve Bellek Dostu Tamponlar (String yerine Char Array)
+volatile uint32_t rtcmPaketSayaci = 0;
+volatile uint32_t ppsSayaci = 0;
+volatile uint32_t sonPpsZamaniMicros = 0; 
+uint32_t sonGuncelleme = 0;
+
+char nmeaBuff[128];
+int nmeaIdx = 0;
 
 // --- PPS KESME FONKSİYONU ---
 void IRAM_ATTR ppsKesmesi() {
   ppsSayaci++;
-  sonPpsZamani = millis();
+  sonPpsZamaniMicros = micros(); 
 }
 
 // --- WEBSOCKET GELEN MESAJ YAKALAYICI ---
@@ -83,8 +97,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ESP32- RTK Telemetri</title>
-    <!-- Leaflet Harita Kütüphanesi -->
+    <title>ESP32 - RTK Telemetry</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <style>
@@ -102,15 +115,13 @@ const char index_html[] PROGMEM = R"rawliteral(
         .sat-box span { display: block; font-size: 10px; color: #888; }
         #map { height: 250px; border-radius: 8px; margin-top: 10px; z-index: 1;}
         canvas { background: #1a1a1a; border-radius: 50%; display: block; margin: 0 auto; border: 2px solid #333;}
-        /* Terminal Stilleri */
         #terminal { height: 110px; overflow-y: auto; background: #000; color: #00ffcc; padding: 8px; border: 1px solid #444; border-radius: 4px; font-size: 12px; margin-top: 5px; font-family: monospace; }
         .term-line { border-bottom: 1px dashed #222; padding-bottom: 3px; margin-bottom: 3px; word-wrap: break-word;}
     </style>
 </head>
 <body>
-    <h2>📡 ESP32 RTK BASE</h2>
+    <h2>📡 ESP32 - RTK BASE</h2>
     <div class="grid">
-        <!-- KONUM VE SİSTEM KARTI -->
         <div class="card">
             <h3>🌐 SİSTEM & KONUM DURUMU</h3>
             <div>Enlem: <span id="lat" class="value">Bekleniyor...</span></div>
@@ -132,7 +143,6 @@ const char index_html[] PROGMEM = R"rawliteral(
             <p style="font-size: 10px; color: #888; margin-top: 5px; margin-bottom: 0;">* '$' ile başlayan komutlara otomatik Checksum eklenir.</p>
         </div>
 
-        <!-- UYDU VE SKYVIEW KARTI -->
         <div class="card">
             <h3>🛰️ UYDU DAĞILIMI (Fiziksel Toplam: <span id="total_sats">0</span>)</h3>
             <div class="sat-grid">
@@ -149,30 +159,19 @@ const char index_html[] PROGMEM = R"rawliteral(
     </div>
 
     <script>
-        // Harita Kurulumu
         var map = L.map('map').setView([41.0, 28.9], 2);
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
         var marker = L.marker([41.0, 28.9]).addTo(map);
         var firstLock = false;
 
-        // BAYRAKLARI ÖNCEDEN YÜKLEME
         var flags = {};
         var flagUrls = {
-            "GP": "https://flagcdn.com/w40/us.png", 
-            "GL": "https://flagcdn.com/w40/ru.png", 
-            "GA": "https://flagcdn.com/w40/eu.png", 
-            "GB": "https://flagcdn.com/w40/cn.png", 
-            "GI": "https://flagcdn.com/w40/in.png", 
-            "GQ": "https://flagcdn.com/w40/jp.png"  
+            "GP": "https://flagcdn.com/w40/us.png", "GL": "https://flagcdn.com/w40/ru.png", 
+            "GA": "https://flagcdn.com/w40/eu.png", "GB": "https://flagcdn.com/w40/cn.png", 
+            "GI": "https://flagcdn.com/w40/in.png", "GQ": "https://flagcdn.com/w40/jp.png"  
         };
-        
-        for(let key in flagUrls){
-            let img = new Image();
-            img.src = flagUrls[key];
-            flags[key] = img;
-        }
+        for(let key in flagUrls){ let img = new Image(); img.src = flagUrls[key]; flags[key] = img; }
 
-        // Skyview Çizimi 
         function drawSkyview(skyData) {
             var canvas = document.getElementById("skyview");
             var ctx = canvas.getContext("2d");
@@ -193,110 +192,54 @@ const char index_html[] PROGMEM = R"rawliteral(
                 var y = cy + satR * Math.sin(rad);
 
                 var balonYaricap = 10; 
+                var glowColor = sat.sn > 35 ? "rgba(0, 255, 0, 0.7)" : sat.sn > 25 ? "rgba(255, 255, 0, 0.7)" : "rgba(255, 0, 0, 0.7)"; 
 
-                var glowColor = sat.sn > 35 ? "rgba(0, 255, 0, 0.7)" : 
-                                sat.sn > 25 ? "rgba(255, 255, 0, 0.7)" : 
-                                "rgba(255, 0, 0, 0.7)"; 
+                ctx.save(); ctx.shadowBlur = (sat.sn / 2) + 5; ctx.shadowColor = glowColor; ctx.fillStyle = glowColor;
+                ctx.beginPath(); ctx.arc(x, y, balonYaricap + 2, 0, 2*Math.PI); ctx.fill(); ctx.restore(); 
 
-                ctx.save();
-                ctx.shadowBlur = (sat.sn / 2) + 5; 
-                ctx.shadowColor = glowColor;
-                ctx.fillStyle = glowColor;
-                ctx.beginPath();
-                ctx.arc(x, y, balonYaricap + 2, 0, 2*Math.PI);
-                ctx.fill();
-                ctx.restore(); 
-
-                ctx.save(); 
-                ctx.beginPath();
-                ctx.arc(x, y, balonYaricap, 0, 2*Math.PI);
-                ctx.clip(); 
-
+                ctx.save(); ctx.beginPath(); ctx.arc(x, y, balonYaricap, 0, 2*Math.PI); ctx.clip(); 
                 if(flags[sat.s] && flags[sat.s].complete) {
                     ctx.drawImage(flags[sat.s], x - balonYaricap, y - balonYaricap, balonYaricap*2, balonYaricap*2);
-                } else {
-                    ctx.fillStyle = "#888"; 
-                    ctx.fill();
-                }
+                } else { ctx.fillStyle = "#888"; ctx.fill(); }
                 ctx.restore(); 
 
-                ctx.beginPath();
-                ctx.arc(x, y, balonYaricap, 0, 2*Math.PI);
-                ctx.strokeStyle = "#fff";
-                ctx.lineWidth = 1.5;
-                ctx.stroke();
+                ctx.beginPath(); ctx.arc(x, y, balonYaricap, 0, 2*Math.PI); ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5; ctx.stroke();
 
-                var sysPrefix = sat.s === "GP" ? "G" : sat.s === "GL" ? "R" : 
-                                sat.s === "GA" ? "E" : sat.s === "GB" ? "B" :
-                                sat.s === "GI" ? "I" : sat.s === "GQ" ? "Q" : "U";
-                
-                ctx.fillStyle = "#eee";
-                ctx.font = "bold 11px Arial";
-                ctx.textAlign = "left";
+                var sysPrefix = sat.s === "GP" ? "G" : sat.s === "GL" ? "R" : sat.s === "GA" ? "E" : sat.s === "GB" ? "B" : sat.s === "GI" ? "I" : sat.s === "GQ" ? "Q" : "U";
+                ctx.fillStyle = "#eee"; ctx.font = "bold 11px Arial"; ctx.textAlign = "left";
                 ctx.fillText(sysPrefix + sat.id, x + balonYaricap + 4, y + 4);
             });
         }
         drawSkyview();
 
-        // WebSocket İşlemleri
         var gateway = `ws://${window.location.hostname}/ws`;
         var websocket;
         function initWebSocket() {
             websocket = new WebSocket(gateway);
-            
-            websocket.onopen = function(event) {
-                logTerminal("<span style='color:#33ff33;'>[SİSTEM] ESP32 Bağlantısı Kuruldu.</span>");
-            };
-            
-            websocket.onclose = function(event) {
-                logTerminal("<span style='color:#ffaa00;'>[SİSTEM] Bağlantı Koptu! Yeniden bağlanılıyor...</span>");
-                setTimeout(initWebSocket, 2000); 
-            };
-
+            websocket.onopen = function(event) { logTerminal("<span style='color:#33ff33;'>[SİSTEM] ESP32 Bağlantısı Kuruldu.</span>"); };
+            websocket.onclose = function(event) { logTerminal("<span style='color:#ffaa00;'>[SİSTEM] Bağlantı Koptu! Yeniden bağlanılıyor...</span>"); setTimeout(initWebSocket, 2000); };
             websocket.onmessage = onMessage;
         }
 
-        // --- HTTP FETCH İLE KOMUT GÖNDERİMİ ---
         function sendCommand() {
             let cmdInput = document.getElementById('cmdInput');
             let cmd = cmdInput.value.trim();
-            
             if (cmd) {
                 let finalCmd = cmd;
-                
-                // Otomatik Checksum hesapla 
                 if (cmd.startsWith('$') && !cmd.includes('*')) {
                     let checksum = 0;
-                    for (let i = 1; i < cmd.length; i++) {
-                        checksum ^= cmd.charCodeAt(i);
-                    }
+                    for (let i = 1; i < cmd.length; i++) checksum ^= cmd.charCodeAt(i);
                     let hexCS = checksum.toString(16).toUpperCase().padStart(2, '0');
                     finalCmd = cmd + '*' + hexCS;
                 }
-
-                // HTTP üzerinden komutu gönder
                 fetch('/cmd?c=' + encodeURIComponent(finalCmd))
-                .then(response => {
-                    if(response.ok) {
-                        logTerminal("<span style='color:#fff; font-weight:bold;'>TX:</span> <span style='color:#00ffcc;'>" + finalCmd + "</span>");
-                    } else {
-                        logTerminal("<span style='color:#ffaa00;'>Cihaz komutu aldı ama sorun oluştu.</span>");
-                    }
-                })
-                .catch(error => {
-                    logTerminal("<span style='color:#ff3333;'>HATA: Modüle ulaşılamadı!</span>");
-                });
-
+                .then(response => { if(response.ok) logTerminal("<span style='color:#fff; font-weight:bold;'>TX:</span> <span style='color:#00ffcc;'>" + finalCmd + "</span>"); })
+                .catch(error => { logTerminal("<span style='color:#ff3333;'>HATA: Modüle ulaşılamadı!</span>"); });
                 cmdInput.value = ""; 
             }
         }
+        document.getElementById("cmdInput").addEventListener("keyup", function(event) { if (event.key === "Enter") sendCommand(); });
 
-        // Enter tuşu ile gönderme
-        document.getElementById("cmdInput").addEventListener("keyup", function(event) {
-            if (event.key === "Enter") sendCommand();
-        });
-
-        // Terminal ekranına yazı ekleme
         function logTerminal(msg) {
             var term = document.getElementById('terminal');
             term.innerHTML += "<div class='term-line'>" + msg + "</div>";
@@ -304,63 +247,37 @@ const char index_html[] PROGMEM = R"rawliteral(
         }
 
         function onMessage(event) {
-            // ==============================================================
-            // YENİ VE %100 GÜVENLİ: JSON'DAN BAĞIMSIZ HAM METİN YAKALAYICI
-            // Eğer gelen mesaj "TERM:" ile başlıyorsa, json parse etmeden direkt yazdır!
-            // ==============================================================
             if (typeof event.data === "string" && event.data.startsWith("TERM:")) {
-                let msg = event.data.substring(5); // "TERM:" kısmını kes
-                logTerminal("<span style='color:#ff3333; font-weight:bold;'>RX:</span> <span style='color:#fff;'>" + msg + "</span>");
-                return; // JSON'a hiç bulaşmadan fonksiyondan çık
+                let msg = event.data.substring(5); 
+                logTerminal("<span style='color:#fff; font-weight:bold;'>RX:</span> <span style='color:#FF0000;'>" + msg + "</span>");
+                return; 
             }
-
             var data;
-            try { 
-                data = JSON.parse(event.data); 
-            } catch(e) { 
-                return; // JSON hatası varsa sessizce çık
-            }
+            try { data = JSON.parse(event.data); } catch(e) { return; }
 
-            // Sadece konum/sistem verisi barındıran paketleri haritaya ve UI'a yansıt
             if (data.lat !== undefined) {
-                document.getElementById('lat').innerText = data.lat.toFixed(6);
-                document.getElementById('lon').innerText = data.lon.toFixed(6);
-                document.getElementById('alt').innerText = data.alt.toFixed(2);
-                document.getElementById('hdop').innerText = data.hdop.toFixed(2);
-                document.getElementById('rtcm').innerText = data.rtcm;
-                document.getElementById('tcp_clients').innerText = data.tcp_clients;
+                document.getElementById('lat').innerText = data.lat.toFixed(6); document.getElementById('lon').innerText = data.lon.toFixed(6);
+                document.getElementById('alt').innerText = data.alt.toFixed(2); document.getElementById('hdop').innerText = data.hdop.toFixed(2);
+                document.getElementById('rtcm').innerText = data.rtcm; document.getElementById('tcp_clients').innerText = data.tcp_clients;
                 document.getElementById('pps_count').innerText = data.pps_count;
                 
                 var ppsEl = document.getElementById('pps_status');
                 if(data.pps_active) {
-                    ppsEl.innerText = "AKTİF (KİLİTLİ)";
-                    ppsEl.className = "value good";
+                    ppsEl.innerText = "AKTİF (KİLİTLİ)"; ppsEl.className = "value good";
                 } else {
-                    ppsEl.innerText = "BEKLENİYOR...";
-                    ppsEl.className = "value alert";
+                    ppsEl.innerText = "BEKLENİYOR..."; ppsEl.className = "value alert";
                 }
 
-                document.getElementById('s-gps').innerText = data.sats.gps;
-                document.getElementById('s-glo').innerText = data.sats.glo;
-                document.getElementById('s-gal').innerText = data.sats.gal;
-                document.getElementById('s-bei').innerText = data.sats.bei;
-                document.getElementById('s-nav').innerText = data.sats.nav;
-                document.getElementById('s-qzs').innerText = data.sats.qzs;
-                
-                var totalSats = data.sats.gps + data.sats.glo + data.sats.gal + data.sats.bei + data.sats.nav + data.sats.qzs;
-                document.getElementById('total_sats').innerText = totalSats;
+                document.getElementById('s-gps').innerText = data.sats.gps; document.getElementById('s-glo').innerText = data.sats.glo;
+                document.getElementById('s-gal').innerText = data.sats.gal; document.getElementById('s-bei').innerText = data.sats.bei;
+                document.getElementById('s-nav').innerText = data.sats.nav; document.getElementById('s-qzs').innerText = data.sats.qzs;
+                document.getElementById('total_sats').innerText = data.sats.gps + data.sats.glo + data.sats.gal + data.sats.bei + data.sats.nav + data.sats.qzs;
               
                 if(data.lat !== 0.0 && data.lon !== 0.0) {
-                    var newLatLng = new L.LatLng(data.lat, data.lon);
-                    marker.setLatLng(newLatLng);
-                    if(!firstLock) {
-                        map.setView(newLatLng, 18);
-                        firstLock = true;
-                    }            
+                    var newLatLng = new L.LatLng(data.lat, data.lon); marker.setLatLng(newLatLng);
+                    if(!firstLock) { map.setView(newLatLng, 18); firstLock = true; }            
                 }
-                if(data.sky) {
-                    drawSkyview(data.sky);
-                }
+                if(data.sky) drawSkyview(data.sky);
             }
         }
         window.addEventListener('load', initWebSocket);
@@ -370,11 +287,38 @@ const char index_html[] PROGMEM = R"rawliteral(
 )rawliteral";
 
 // ==========================================
-// 4. NMEA AYRIŞTIRICI
+// 4. NMEA AYRIŞTIRICI & GÜVENLİK
 // ==========================================
+
+// --- GÜVENLİK DUVARI: NMEA CHECKSUM DOĞRULAYICI ---
+bool isChecksumValid(const char* sentence) {
+  int len = strlen(sentence);
+  if (len < 5) return false; 
+  
+  int starIndex = -1;
+  for (int i = 0; i < len; i++) {
+    if (sentence[i] == '*') {
+      starIndex = i;
+      break;
+    }
+  }
+  
+  if (starIndex == -1 || starIndex > len - 3) return false;
+  
+  uint8_t calculatedCS = 0;
+  for (int i = 1; i < starIndex; i++) {
+    calculatedCS ^= sentence[i];
+  }
+  
+  char hexStr[3] = {sentence[starIndex + 1], sentence[starIndex + 2], '\0'};
+  uint8_t providedCS = (uint8_t)strtol(hexStr, NULL, 16);
+  
+  return (calculatedCS == providedCS); 
+}
+
 void uyduTipleriniAyristir(String nmea) {
   if (nmea.indexOf("GSV") != -1) {
-    String sys = "UN";
+    const char* sys = "UN";
     if (nmea.startsWith("$GP")) sys = "GP";
     else if (nmea.startsWith("$GL")) sys = "GL";
     else if (nmea.startsWith("$GA")) sys = "GA";
@@ -399,8 +343,7 @@ void uyduTipleriniAyristir(String nmea) {
         int snr = nmea.substring(commaIndex[i+2] + 1, commaIndex[i+3]).toInt(); 
         
         if (id > 0) {
-          SatData s = {id, sys, elev, azim, snr};
-          activeSats.insert(s); 
+          addSat(sys, id, elev, azim, snr); 
         }
       }
     }
@@ -420,18 +363,14 @@ void setup() {
   Serial.println("\n=== WI-FI BAGLANTISI BEKLENIYOR ===");
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500); Serial.print(".");
-  }
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
   Serial.println("\nBAGLANDI! Tarayicinizdan su adrese gidin:");
   Serial.println(WiFi.localIP());
 
-  // Web Sunucu Yönlendirmeleri
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
    request->send_P(200, "text/html", index_html);
   });
 
-  // --- HTTP Komut API'si ---
   server.on("/cmd", HTTP_GET, [](AsyncWebServerRequest *request){
     if(request->hasParam("c")){
       String komut = request->getParam("c")->value();
@@ -448,7 +387,6 @@ void setup() {
   rtcmServer.begin();
   server.begin();
 
-  // Modül Ayarları 
   Serial2.println("$PAIR062,0,1*3F"); 
   delay(100);
   Serial2.println("$PAIR062,3,1*3C"); 
@@ -466,8 +404,8 @@ void setup() {
 void loop() {
   ws.cleanupClients(); 
   
-  // --- 1. TCP İstemci Bağlantı Kontrolü ---
-  if (rtcmServer.hasClient()) {
+  // --- TCP İstemci Bağlantı Kontrolü (While ile Çoklu Bağlantı Desteği) ---
+  while (rtcmServer.hasClient()) {
     bool added = false;
     for (int i = 0; i < 3; i++) {
       if (!tcpClients[i] || !tcpClients[i].connected()) {
@@ -480,12 +418,11 @@ void loop() {
     if (!added) rtcmServer.available().stop(); 
   }
 
-  // --- 2. UART Veri Okuma, Filtreleme ve TCP Yayını ---
+  // --- UART Veri Okuma (BELLEK DOSTU CHAR BUFFER MİMARİSİ) ---
   size_t bytesAvailable = Serial2.available();
   if (bytesAvailable > 0) {
     uint8_t buf[128]; 
     if (bytesAvailable > sizeof(buf)) bytesAvailable = sizeof(buf);
-    
     size_t len = Serial2.read(buf, bytesAvailable);
 
     // A) Veriyi TCP İstemcilerine Fırlat
@@ -495,66 +432,58 @@ void loop() {
       }
     }
 
-    // B) Kendi Sistemimiz İçin Veriyi Ayrıştır ve RX Cevaplarını Yakala
+    // B) Kendi Sistemimiz İçin Veriyi Ayrıştır
     for (size_t i = 0; i < len; i++) {
       uint8_t b = buf[i];
       gps.encode(b); 
       if (b == 0xD3) rtcmPaketSayaci++;
       
-      // --- AKILLI NMEA VE RX FİLTRESİ ---
-      if (b == '$') {
-        nmeaTampon = "$";
-      } else if (b == '\n') {
-        // Satır tamamlandı. Boşlukları ve \r'yi temizle.
-        nmeaTampon.trim(); 
-        
-        // TİTANYUM FİLTRE
-        String temizCevap = "";
-        for (int k = 0; k < nmeaTampon.length(); k++) {
-          char c = nmeaTampon[k];
-          // Sadece harfler, rakamlar ve standart noktalama işaretleri
-          if (isalnum(c) || c == '$' || c == ',' || c == '.' || c == '*' || c == '-' || c == '_' || c == ' ' || c == ':') {
-            temizCevap += c;
-          }
-        }
-        nmeaTampon = temizCevap; // %100 temizlenmiş metin
-        
-        if (nmeaTampon.length() > 0) {
-          // Eğer $ ile başlıyorsa TinyGPS harici kendi uydu radarımız için de ayrıştır
-          if (nmeaTampon.startsWith("$")) {
-             uyduTipleriniAyristir(nmeaTampon); 
+      char c = (char)b;
+      
+      if (c == '$') {
+        nmeaIdx = 0;
+        nmeaBuff[nmeaIdx++] = c;
+      } else if (c == '\n') {
+        if (nmeaIdx > 0 && nmeaBuff[0] == '$') {
+          // Satır sonundaki gizli \r karakterini temizle
+          if (nmeaBuff[nmeaIdx - 1] == '\r') {
+            nmeaBuff[nmeaIdx - 1] = '\0';
+          } else {
+            nmeaBuff[nmeaIdx] = '\0'; 
           }
           
-          // KARA LİSTE (BLACKLIST) FİLTRESİ
-          // Standart konum verileri DEĞİLSE bu bir cevaptır!
-          if (!nmeaTampon.startsWith("$GN") && 
-              !nmeaTampon.startsWith("$GP") && 
-              !nmeaTampon.startsWith("$GL") && 
-              !nmeaTampon.startsWith("$GA") && 
-              !nmeaTampon.startsWith("$GB") && 
-              !nmeaTampon.startsWith("$GQ") &&
-              !nmeaTampon.startsWith("$BD")) {
+          // ==========================================================
+          // GÜVENLİK KAPISI: EĞER MATEMATİK TUTMUYORSA RTCM GÜRÜLTÜSÜDÜR!
+          // ==========================================================
+          if (isChecksumValid(nmeaBuff)) {
+            String gecerliCevap = String(nmeaBuff); 
             
-            Serial.println("[MODUL CEVABI]: " + nmeaTampon);
+            uyduTipleriniAyristir(gecerliCevap); 
             
-            // ==============================================================
-            // YENİ: JSON İLE UĞRAŞMADAN ANINDA HAM METİN OLARAK FIRLAT!
-            // Tarayıcı bunu görüp anında kırmızı RX olarak ekrana basacak.
-            // ==============================================================
-            ws.textAll("TERM:" + nmeaTampon);
+            // KARA LİSTE FİLTRESİ
+            if (!gecerliCevap.startsWith("$GN") && 
+                !gecerliCevap.startsWith("$GP") && 
+                !gecerliCevap.startsWith("$GL") && 
+                !gecerliCevap.startsWith("$GA") && 
+                !gecerliCevap.startsWith("$GB") && 
+                !gecerliCevap.startsWith("$GQ") &&
+                !gecerliCevap.startsWith("$BD")) {
+              
+              Serial.println("[MODUL CEVABI]: " + gecerliCevap);
+              ws.textAll("TERM:" + gecerliCevap);
+            }
           }
         }
-        nmeaTampon = ""; // Tamponu sıfırla
-      } else if (b >= 32 && b <= 126) {
-        // Sadece okunabilir karakterleri al (RTCM gürültüsünü engeller)
-        if (nmeaTampon.length() < 120) {
-          nmeaTampon += (char)b;
+        nmeaIdx = 0; 
+      } else if (c >= 32 && c <= 126 && nmeaIdx > 0) {
+        if (nmeaIdx < 127) {
+          nmeaBuff[nmeaIdx++] = c;
         }
       }
     }
   }
 
-  // 3. Her 1 Saniyede Bir Web Arayüzüne Genel Veri Yolla
+  // --- Her 1 Saniyede Bir Web Arayüzüne Genel Veri Yolla ---
   if (millis() - sonGuncelleme >= 1000) {
     sonGuncelleme = millis();
 
@@ -574,18 +503,20 @@ void loop() {
 
       doc["rtcm"] = rtcmPaketSayaci;
       doc["pps_count"] = ppsSayaci;
-      doc["pps_active"] = (millis() - sonPpsZamani < 2000) ? true : false;
+      // millis() yerine micros() üzerinden 2 saniyelik (2.000.000 mikrosaniye) fark kontrolü
+      doc["pps_active"] = (micros() - sonPpsZamaniMicros < 2000000) ? true : false; 
 
       int sGPS=0, sGLO=0, sGAL=0, sBEI=0, sNAV=0, sQZS=0;
       JsonArray sky = doc["sky"].to<JsonArray>();
       
-      for (auto const& s : activeSats) {
-        if(s.sys == "GP") sGPS++;
-        else if(s.sys == "GL") sGLO++;
-        else if(s.sys == "GA") sGAL++;
-        else if(s.sys == "GB") sBEI++;
-        else if(s.sys == "GI") sNAV++;
-        else if(s.sys == "GQ") sQZS++;
+      for (int i = 0; i < activeSatCount; i++) {
+        SatData s = activeSats[i];
+        if(strcmp(s.sys, "GP") == 0) sGPS++;
+        else if(strcmp(s.sys, "GL") == 0) sGLO++;
+        else if(strcmp(s.sys, "GA") == 0) sGAL++;
+        else if(strcmp(s.sys, "GB") == 0) sBEI++;
+        else if(strcmp(s.sys, "GI") == 0) sNAV++;
+        else if(strcmp(s.sys, "GQ") == 0) sQZS++;
         
         if(s.elev > 0 || s.azim > 0) {
           JsonObject obj = sky.add<JsonObject>();
@@ -607,6 +538,6 @@ void loop() {
     }
 
     rtcmPaketSayaci = 0;
-    activeSats.clear();
+    activeSatCount = 0; // Diziyi her saniye baştan yazmak için sayacı sıfırla
   }
 }
