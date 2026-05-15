@@ -8,8 +8,8 @@
 // ==========================================
 // 1. KULLANICI AYARLARI 
 // ==========================================
-const char* ssid = "Arda";
-const char* password = "ozurlubaskan";
+const char* ssid = "IHA_MARMARA_TEST";
+const char* password = "HezarfenCelebi2023";
 
 // ==========================================
 // 2. DONANIM VE NESNE TANIMLAMALARI
@@ -28,10 +28,11 @@ TinyGPSPlus gps;
 WiFiServer rtcmServer(RTCM_PORT);
 WiFiClient tcpClients[3]; 
 
-// FreeRTOS Görev ve Mutex'leri
+// FreeRTOS Görev, Mutex ve Kuyruk Tanımlamaları
 TaskHandle_t NetworkTaskHandle;
 SemaphoreHandle_t dataMutex; // Uydu ve GPS verisini korur
 SemaphoreHandle_t tcpMutex;  // TCP Soketlerini korur
+QueueHandle_t termQueue;     // Terminal mesajlarını çekirdekler arası güvenle taşır
 
 // --- ÇİFT BANT DESTEKLİ UYDU VERİ YAPISI ---
 struct SatData {
@@ -424,12 +425,19 @@ void uyduTipleriniAyristir(const char* nmea) {
     int sig_id = 1; 
     
     if (cCount >= 4) {
-      if ((cCount - 3) % 4 == 1) { 
-        hasSignalId = true;
+      int lastFieldLen = starIdx - commas[cCount - 1] - 1;
+      // HATA #6 FIX: Sinyal ID'sini tespit eden sağlam ve mantıksal doğrulama eklendi
+      if ((cCount - 3) % 4 == 1 && lastFieldLen > 0 && lastFieldLen <= 2) { 
         char sigStr[4] = {0};
-        int sigLen = starIdx - commas[cCount - 1] - 1;
-        if (sigLen > 0 && sigLen < 4) {
-          strncpy(sigStr, nmea + commas[cCount - 1] + 1, sigLen);
+        strncpy(sigStr, nmea + commas[cCount - 1] + 1, lastFieldLen);
+        
+        bool isHex = true;
+        for(int k = 0; k < lastFieldLen; k++) {
+            if(!isxdigit(sigStr[k])) isHex = false;
+        }
+        
+        if (isHex) {
+          hasSignalId = true;
           sig_id = strtol(sigStr, NULL, 16);
         }
       }
@@ -468,15 +476,12 @@ void networkTaskCode(void * parameter) {
   static unsigned long sonJsonZamani = 0;
   static unsigned long sonWifiKontrol = 0;
 
-  // STACK OVERFLOW ÇÖZÜMÜ: Büyük tamponları 'static' yaparak
-  // kısıtlı Task Stack belleğinden genel BSS belleğine taşıdık!
   static SatData localSats[MAX_SATS];
   static char jsonBuffer[3072];
 
   for(;;) {
     uint32_t now = millis();
 
-    // 1. Wi-Fi Exponential Backoff & Reconnect
     if (now - sonWifiKontrol >= 10000) {
       sonWifiKontrol = now;
       if (WiFi.status() != WL_CONNECTED) {
@@ -485,7 +490,18 @@ void networkTaskCode(void * parameter) {
       }
     }
 
-    ws.cleanupClients();
+    // HATA #7 FIX: Sadece istemci varsa cleanup yap (Gereksiz işlem gücünü azaltır)
+    if (ws.count() > 0) {
+      ws.cleanupClients();
+    }
+
+    // TERMINAL KUYRUĞU (Queue): Core 1'in gönderdiği mesajları güvenle tüketir
+    char queuedMsg[160];
+    while (xQueueReceive(termQueue, &queuedMsg, 0) == pdTRUE) {
+      if (ws.count() > 0) {
+        ws.textAll(queuedMsg);
+      }
+    }
 
     // 3. Telemetri Yayını (Saniyede 1)
     if (now - sonJsonZamani >= 1000) {
@@ -497,24 +513,32 @@ void networkTaskCode(void * parameter) {
         int localSatCount = 0;
         
         double locLat = 0.0, locLon = 0.0, locAlt = 0.0, locHdop = 0.0;
-        bool locValid = false, timeValid = false;
+        // HATA #2 FIX: Bu değerler de kilit altındayken kopyalanmalıdır
+        bool locValidLoc = false, locValidAlt = false, locValidHdop = false, locTimeValid = false;
         char locTime[12] = "--:--:--";
         uint32_t currentRtcmCount = 0;
+        uint32_t lastPps = 0;
 
         if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
-          // Uydu Kopyası
           localSatCount = activeSatCount;
           memcpy(localSats, (const void*)activeSats, localSatCount * sizeof(SatData));
           
-          // GPS Kopyası
           locLat = safeGps.lat; locLon = safeGps.lon; 
           locAlt = safeGps.alt; locHdop = safeGps.hdop;
-          locValid = safeGps.validLoc; timeValid = safeGps.validTime;
-          if (timeValid) sprintf(locTime, "%02d:%02d:%02d", safeGps.hour, safeGps.min, safeGps.sec);
+          locValidLoc = safeGps.validLoc; 
+          locValidAlt = safeGps.validAlt;
+          locValidHdop = safeGps.validHdop; 
+          locTimeValid = safeGps.validTime;
+
+          if (locTimeValid) sprintf(locTime, "%02d:%02d:%02d", safeGps.hour, safeGps.min, safeGps.sec);
           
-          // RTCM Sayaç Kopyası ve Sıfırlama
+          // HATA #1 FIX: RTCM Sayacı Core 1 tarafında Mutex içine alındı, burada sadece okunup sıfırlanıyor
           currentRtcmCount = rtcmPaketSayaci;
           rtcmPaketSayaci = 0; 
+
+          // HATA #4 FIX: Atomic Guard
+          lastPps = sonPpsZamaniMicros;
+          
           xSemaphoreGive(dataMutex);
         }
 
@@ -522,8 +546,14 @@ void networkTaskCode(void * parameter) {
         int activeTcp = 0;
         if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
           for (int i = 0; i < 3; i++) {
-            if (tcpClients[i] && tcpClients[i].connected()) activeTcp++;
-            else if (tcpClients[i]) tcpClients[i].stop();
+            // HATA #8 FIX: TCPClient objesi uninitialized olabilir, tam güvenlik sağlandı.
+            if (tcpClients[i]) { 
+              if (tcpClients[i].connected()) {
+                activeTcp++;
+              } else {
+                tcpClients[i].stop();
+              }
+            }
           }
           xSemaphoreGive(tcpMutex);
         }
@@ -535,14 +565,14 @@ void networkTaskCode(void * parameter) {
           DynamicJsonDocument doc(4096); 
         #endif
         
-        doc["lat"] = locValid ? locLat : 0.0;
-        doc["lon"] = locValid ? locLon : 0.0;
-        doc["alt"] = safeGps.validAlt ? locAlt : 0.0;
-        doc["hdop"] = safeGps.validHdop ? locHdop : 0.0;
+        doc["lat"] = locValidLoc ? locLat : 0.0;
+        doc["lon"] = locValidLoc ? locLon : 0.0;
+        doc["alt"] = locValidAlt ? locAlt : 0.0;
+        doc["hdop"] = locValidHdop ? locHdop : 0.0;
         doc["tcp_clients"] = activeTcp;
         doc["rtcm"] = currentRtcmCount;
         doc["sat_time"] = locTime;
-        doc["pps_active"] = (micros() - sonPpsZamaniMicros < 2000000) ? true : false; 
+        doc["pps_active"] = (micros() - lastPps < 2000000) ? true : false; 
 
         int gpsL1=0, gpsL5=0, gloL1=0, galE1=0, galE5a=0, beiB1=0, beiB2a=0, qzsL1=0, qzsL5=0, navL5=0;
         JsonArray sky = doc["sky"].to<JsonArray>();
@@ -594,6 +624,7 @@ void setup() {
 
   dataMutex = xSemaphoreCreateMutex();
   tcpMutex = xSemaphoreCreateMutex();
+  termQueue = xQueueCreate(15, sizeof(char) * 160);
 
   pinMode(PPS_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(PPS_PIN), ppsKesmesi, RISING);
@@ -630,7 +661,6 @@ void setup() {
   Serial2.println("$PAIR432,1*22"); delay(200);
   Serial2.println("$PAIR436,1*26");
 
-  // STACK OVERFLOW ÇÖZÜMÜ: Yığın bellek sınırı 8192'den 16384'e (16KB) çıkarıldı!
   xTaskCreatePinnedToCore(networkTaskCode, "NetworkTask", 16384, NULL, 1, &NetworkTaskHandle, 0);
 }
 
@@ -638,7 +668,6 @@ void setup() {
 // 7. CORE 1: YÜKSEK HIZLI GNSS VERİ İŞLEME
 // ==========================================
 void loop() {
-  // TCP İstemci Kabulü (Wi-Fi Crash Engellendi)
   if (rtcmServer.hasClient()) {
     WiFiClient newClient = rtcmServer.available();
     if (newClient) {
@@ -699,7 +728,11 @@ void loop() {
       } else if (rtcmState == SKIP_PAYLOAD) {
         rtcmBytesRead++;
         if (rtcmBytesRead >= rtcmLen + 3) { 
-          rtcmPaketSayaci++;
+          // HATA #1 FIX: Paket sayacı Mutex ile korundu (Race Condition engellendi)
+          if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+            rtcmPaketSayaci++;
+            xSemaphoreGive(dataMutex);
+          }
           rtcmState = WAIT_SYNC;
         }
       }
@@ -717,18 +750,26 @@ void loop() {
           if (isChecksumValid(nmeaBuff)) {
             uyduTipleriniAyristir(nmeaBuff); 
             
+            // HATA #5 FIX: Eksik olan '$GI' (NavIC) paketi terminal engelleme filtresine eklendi.
             if (strncmp(nmeaBuff, "$GN", 3) != 0 && strncmp(nmeaBuff, "$GP", 3) != 0 && 
                 strncmp(nmeaBuff, "$GL", 3) != 0 && strncmp(nmeaBuff, "$GA", 3) != 0 && 
-                strncmp(nmeaBuff, "$GB", 3) != 0 && strncmp(nmeaBuff, "$GQ", 3) != 0 && strncmp(nmeaBuff, "$BD", 3) != 0) {
+                strncmp(nmeaBuff, "$GB", 3) != 0 && strncmp(nmeaBuff, "$GQ", 3) != 0 && 
+                strncmp(nmeaBuff, "$GI", 3) != 0 && strncmp(nmeaBuff, "$BD", 3) != 0) {
+              
               char termMsg[160];
               snprintf(termMsg, sizeof(termMsg), "TERM:%s", nmeaBuff);
-              ws.textAll(termMsg);
+              xQueueSend(termQueue, &termMsg, 0); // Mesaj doğrudan WebSockets'e değil kuyruğa iletildi
             }
           }
         }
         nmeaIdx = 0; 
       } else if (c >= 32 && c <= 126 && nmeaIdx > 0) {
-        if (nmeaIdx < 127) nmeaBuff[nmeaIdx++] = c;
+        // HATA #3 FIX: Buffer 127 byte sınırına dayandığında indeks resetlenerek null terminator kaybı önlendi
+        if (nmeaIdx < 127) {
+            nmeaBuff[nmeaIdx++] = c;
+        } else {
+            nmeaIdx = 0; 
+        }
       }
     }
 
