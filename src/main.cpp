@@ -8,8 +8,8 @@
 // ==========================================
 // 1. KULLANICI AYARLARI 
 // ==========================================
-const char* ssid = "IHA_MARMARA_TEST";
-const char* password = "HezarfenCelebi2023";
+const char* ssid = "Arda";
+const char* password = "ozurlubaskan";
 
 // ==========================================
 // 2. DONANIM VE NESNE TANIMLAMALARI
@@ -59,7 +59,9 @@ struct GpsSnapshot {
 volatile uint32_t rtcmPaketSayaci = 0;
 volatile uint32_t sonPpsZamaniMicros = 0; 
 
-char nmeaBuff[128];
+// HATA FIX: Modern NMEA mesajları için 256 byte Buffer
+#define MAX_NMEA 256
+char nmeaBuff[MAX_NMEA];
 int nmeaIdx = 0;
 
 void IRAM_ATTR ppsKesmesi() {
@@ -426,7 +428,6 @@ void uyduTipleriniAyristir(const char* nmea) {
     
     if (cCount >= 4) {
       int lastFieldLen = starIdx - commas[cCount - 1] - 1;
-      // HATA #6 FIX: Sinyal ID'sini tespit eden sağlam ve mantıksal doğrulama eklendi
       if ((cCount - 3) % 4 == 1 && lastFieldLen > 0 && lastFieldLen <= 2) { 
         char sigStr[4] = {0};
         strncpy(sigStr, nmea + commas[cCount - 1] + 1, lastFieldLen);
@@ -482,22 +483,23 @@ void networkTaskCode(void * parameter) {
   for(;;) {
     uint32_t now = millis();
 
+    // HATA FIX: WiFi.reconnect() Deprecation
     if (now - sonWifiKontrol >= 10000) {
       sonWifiKontrol = now;
       if (WiFi.status() != WL_CONNECTED) {
         Serial.println("[WIFI] Baglanti Koptu! Yeniden baglaniliyor...");
-        WiFi.reconnect();
+        WiFi.disconnect();
+        WiFi.begin(ssid, password);
       }
     }
 
-    // HATA #7 FIX: Sadece istemci varsa cleanup yap (Gereksiz işlem gücünü azaltır)
     if (ws.count() > 0) {
       ws.cleanupClients();
     }
 
-    // TERMINAL KUYRUĞU (Queue): Core 1'in gönderdiği mesajları güvenle tüketir
+    // HATA FIX: Queue Pointer (Array Decay - & İşareti Kaldırıldı)
     char queuedMsg[160];
-    while (xQueueReceive(termQueue, &queuedMsg, 0) == pdTRUE) {
+    while (xQueueReceive(termQueue, queuedMsg, 0) == pdTRUE) {
       if (ws.count() > 0) {
         ws.textAll(queuedMsg);
       }
@@ -513,7 +515,6 @@ void networkTaskCode(void * parameter) {
         int localSatCount = 0;
         
         double locLat = 0.0, locLon = 0.0, locAlt = 0.0, locHdop = 0.0;
-        // HATA #2 FIX: Bu değerler de kilit altındayken kopyalanmalıdır
         bool locValidLoc = false, locValidAlt = false, locValidHdop = false, locTimeValid = false;
         char locTime[12] = "--:--:--";
         uint32_t currentRtcmCount = 0;
@@ -532,27 +533,22 @@ void networkTaskCode(void * parameter) {
 
           if (locTimeValid) sprintf(locTime, "%02d:%02d:%02d", safeGps.hour, safeGps.min, safeGps.sec);
           
-          // HATA #1 FIX: RTCM Sayacı Core 1 tarafında Mutex içine alındı, burada sadece okunup sıfırlanıyor
           currentRtcmCount = rtcmPaketSayaci;
           rtcmPaketSayaci = 0; 
 
-          // HATA #4 FIX: Atomic Guard
           lastPps = sonPpsZamaniMicros;
           
           xSemaphoreGive(dataMutex);
         }
 
-        // --- 2. ADIM: TCP İSTEMCİ SAYIMI (Thread-Safe) ---
+        // HATA FIX: Thread-Safe ve Initialized TCP Client Kontrolü
         int activeTcp = 0;
         if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
           for (int i = 0; i < 3; i++) {
-            // HATA #8 FIX: TCPClient objesi uninitialized olabilir, tam güvenlik sağlandı.
-            if (tcpClients[i]) { 
-              if (tcpClients[i].connected()) {
-                activeTcp++;
-              } else {
-                tcpClients[i].stop();
-              }
+            if (tcpClients[i].connected()) {
+              activeTcp++;
+            } else {
+              tcpClients[i].stop();
             }
           }
           xSemaphoreGive(tcpMutex);
@@ -640,10 +636,12 @@ void setup() {
    request->send_P(200, "text/html", index_html);
   });
 
+  // HATA FIX: String kullanımı silindi, const char* ile Heap Fragmentation önlendi
   server.on("/cmd", HTTP_GET, [](AsyncWebServerRequest *request){
     if(request->hasParam("c")){
-      String komut = request->getParam("c")->value();
-      Serial2.print(komut + "\r\n"); 
+      const char* komut = request->getParam("c")->value().c_str();
+      Serial2.print(komut); 
+      Serial2.print("\r\n"); 
       request->send(200, "text/plain", "OK"); 
     } else {
       request->send(400, "text/plain", "BOS");
@@ -674,8 +672,8 @@ void loop() {
       bool added = false;
       if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
         for (int i = 0; i < 3; i++) {
-          if (!tcpClients[i] || !tcpClients[i].connected()) {
-            if (tcpClients[i]) tcpClients[i].stop();
+          if (!tcpClients[i].connected()) {
+            tcpClients[i].stop();
             tcpClients[i] = newClient;
             added = true;
             break;
@@ -693,10 +691,14 @@ void loop() {
     if (bytesAvailable > sizeof(buf)) bytesAvailable = sizeof(buf);
     size_t len = Serial2.read(buf, bytesAvailable);
 
+    // HATA FIX: Partial Write Control (TCP koptuğunda soketi güvenle temizler)
     if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
       for (int i = 0; i < 3; i++) {
-        if (tcpClients[i] && tcpClients[i].connected()) {
-          tcpClients[i].write(buf, len);
+        if (tcpClients[i].connected()) {
+          size_t written = tcpClients[i].write(buf, len);
+          if (written < len) {
+              tcpClients[i].stop();
+          }
         }
       }
       xSemaphoreGive(tcpMutex);
@@ -728,7 +730,6 @@ void loop() {
       } else if (rtcmState == SKIP_PAYLOAD) {
         rtcmBytesRead++;
         if (rtcmBytesRead >= rtcmLen + 3) { 
-          // HATA #1 FIX: Paket sayacı Mutex ile korundu (Race Condition engellendi)
           if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
             rtcmPaketSayaci++;
             xSemaphoreGive(dataMutex);
@@ -750,7 +751,7 @@ void loop() {
           if (isChecksumValid(nmeaBuff)) {
             uyduTipleriniAyristir(nmeaBuff); 
             
-            // HATA #5 FIX: Eksik olan '$GI' (NavIC) paketi terminal engelleme filtresine eklendi.
+            // HATA FIX: Queue Pointer (Array Decay)
             if (strncmp(nmeaBuff, "$GN", 3) != 0 && strncmp(nmeaBuff, "$GP", 3) != 0 && 
                 strncmp(nmeaBuff, "$GL", 3) != 0 && strncmp(nmeaBuff, "$GA", 3) != 0 && 
                 strncmp(nmeaBuff, "$GB", 3) != 0 && strncmp(nmeaBuff, "$GQ", 3) != 0 && 
@@ -758,14 +759,14 @@ void loop() {
               
               char termMsg[160];
               snprintf(termMsg, sizeof(termMsg), "TERM:%s", nmeaBuff);
-              xQueueSend(termQueue, &termMsg, 0); // Mesaj doğrudan WebSockets'e değil kuyruğa iletildi
+              xQueueSend(termQueue, termMsg, 0); 
             }
           }
         }
         nmeaIdx = 0; 
       } else if (c >= 32 && c <= 126 && nmeaIdx > 0) {
-        // HATA #3 FIX: Buffer 127 byte sınırına dayandığında indeks resetlenerek null terminator kaybı önlendi
-        if (nmeaIdx < 127) {
+        // HATA FIX: NMEA Buffer Overflow Risk & Graceful Truncation
+        if (nmeaIdx < MAX_NMEA - 1) {
             nmeaBuff[nmeaIdx++] = c;
         } else {
             nmeaIdx = 0; 
