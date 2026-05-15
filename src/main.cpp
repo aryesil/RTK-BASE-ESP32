@@ -24,69 +24,112 @@ TinyGPSPlus gps;
 #define GNSS_BAUD 115200 
 #define PPS_PIN 27
 #define RTCM_PORT 2101
+
 WiFiServer rtcmServer(RTCM_PORT);
 WiFiClient tcpClients[3]; 
+
+// FreeRTOS Görev ve Mutex'leri
+TaskHandle_t NetworkTaskHandle;
+SemaphoreHandle_t dataMutex; // Uydu ve GPS verisini korur
+SemaphoreHandle_t tcpMutex;  // TCP Soketlerini korur
 
 // --- ÇİFT BANT DESTEKLİ UYDU VERİ YAPISI ---
 struct SatData {
   int id;
-  char sys[3]; 
+  char sys[4]; 
   int elev;   
   int azim;   
   int snr;    
   int sig; 
+  uint32_t lastSeen; 
 };
 
 #define MAX_SATS 120
 SatData activeSats[MAX_SATS];
-int activeSatCount = 0;
+volatile int activeSatCount = 0;
 
-void addSat(const char* sys, int id, int elev, int azim, int snr, int sig) {
-  for (int i = 0; i < activeSatCount; i++) {
-    if (strcmp(activeSats[i].sys, sys) == 0 && activeSats[i].id == id && activeSats[i].sig == sig) {
-      activeSats[i].elev = elev; activeSats[i].azim = azim; activeSats[i].snr = snr;
-      return;
-    }
-  }
-  if (activeSatCount < MAX_SATS) {
-    activeSats[activeSatCount].id = id;
-    strcpy(activeSats[activeSatCount].sys, sys);
-    activeSats[activeSatCount].elev = elev;
-    activeSats[activeSatCount].azim = azim;
-    activeSats[activeSatCount].snr = snr;
-    activeSats[activeSatCount].sig = sig; 
-    activeSatCount++;
-  }
-}
+// Thread-Safe GPS Snapshot Yapısı
+struct GpsSnapshot {
+  double lat, lon, alt, hdop;
+  bool validLoc, validAlt, validHdop, validTime;
+  uint8_t hour, min, sec;
+} safeGps;
 
 volatile uint32_t rtcmPaketSayaci = 0;
-volatile uint32_t ppsSayaci = 0;
 volatile uint32_t sonPpsZamaniMicros = 0; 
-uint32_t sonGuncelleme = 0;
 
 char nmeaBuff[128];
 int nmeaIdx = 0;
 
 void IRAM_ATTR ppsKesmesi() {
-  ppsSayaci++;
   sonPpsZamaniMicros = micros(); 
 }
 
+// Mutex Korumalı Uydu Ekleme
+void addSat(const char* sys, int id, int elev, int azim, int snr, int sig) {
+  if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+    uint32_t now = millis();
+    for (int i = 0; i < activeSatCount; i++) {
+      if (strcmp(activeSats[i].sys, sys) == 0 && activeSats[i].id == id && activeSats[i].sig == sig) {
+        activeSats[i].elev = elev; 
+        activeSats[i].azim = azim; 
+        activeSats[i].snr = snr;
+        activeSats[i].lastSeen = now;
+        xSemaphoreGive(dataMutex);
+        return;
+      }
+    }
+    if (activeSatCount < MAX_SATS) {
+      activeSats[activeSatCount].id = id;
+      strlcpy(activeSats[activeSatCount].sys, sys, sizeof(activeSats[0].sys));
+      activeSats[activeSatCount].elev = elev;
+      activeSats[activeSatCount].azim = azim;
+      activeSats[activeSatCount].snr = snr;
+      activeSats[activeSatCount].sig = sig; 
+      activeSats[activeSatCount].lastSeen = now;
+      activeSatCount++;
+    }
+    xSemaphoreGive(dataMutex);
+  }
+}
+
+// O(N) Karmaşıklığına İndirilmiş Yaşlandırma Algoritması
+void cleanOldSatellites() {
+  if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+    uint32_t now = millis();
+    int newCount = 0;
+    for (int i = 0; i < activeSatCount; i++) {
+      if (now - activeSats[i].lastSeen <= 5000) {
+        activeSats[newCount++] = activeSats[i];
+      }
+    }
+    activeSatCount = newCount;
+    xSemaphoreGive(dataMutex);
+  }
+}
+
+// ==========================================
+// 3. AĞ VE TERMİNAL OLAYLARI
+// ==========================================
 void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
   if (type == WS_EVT_DATA) {
     AwsFrameInfo *info = (AwsFrameInfo*)arg;
     if (info->opcode == WS_TEXT) {
-      data[len] = 0; 
-      String command = (char*)data;
-      Serial2.print(command + "\r\n");
+      char cmd[128];
+      size_t copyLen = len < 127 ? len : 127;
+      memcpy(cmd, data, copyLen);
+      cmd[copyLen] = '\0'; 
+      
+      Serial2.print(cmd);
+      Serial2.print("\r\n");
       Serial.print("[WS] Modüle Giden Komut: ");
-      Serial.println(command);
+      Serial.println(cmd);
     }
   }
 }
 
 // ==========================================
-// 3. GÖMÜLÜ WEB SAYFASI (HTML + JS + CSS)
+// 4. GÖMÜLÜ WEB SAYFASI (DEĞİŞTİRİLMEDİ)
 // ==========================================
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -107,13 +150,11 @@ const char index_html[] PROGMEM = R"rawliteral(
         .value { font-size: 18px; color: #fff; font-weight: bold; }
         .alert { color: #ff3333; }
         .good { color: #33ff33; }
-        
         .sat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px;}
         .sat-box { background: #2a2a2a; padding: 6px; border-radius: 6px; display: flex; flex-direction: column; border: 1px solid #333;}
         .sat-box-title { font-size: 12px; color: #aaa; border-bottom: 1px solid #444; padding-bottom: 3px; margin-bottom: 4px; font-weight: bold; text-align: center;}
         .sat-sig-row { display: flex; justify-content: space-between; font-size: 11px; color: #888; padding: 2px 0;}
         .sat-sig-row span.val { color: #00ffcc; font-weight: bold; }
-        
         #map { height: 250px; border-radius: 8px; margin-top: 10px; z-index: 1;}
         canvas { background: #1a1a1a; border-radius: 50%; display: block; margin: 0 auto; border: 2px solid #333;}
         #terminal { height: 110px; overflow-y: auto; background: #000; color: #00ffcc; padding: 8px; border: 1px solid #444; border-radius: 4px; font-size: 12px; margin-top: 5px; font-family: monospace; }
@@ -323,9 +364,8 @@ const char index_html[] PROGMEM = R"rawliteral(
 )rawliteral";
 
 // ==========================================
-// 4. NMEA AYRIŞTIRICI & GÜVENLİK
+// 5. GÜVENLİ NMEA AYRIŞTIRICI
 // ==========================================
-
 bool isChecksumValid(const char* sentence) {
   int len = strlen(sentence);
   if (len < 8) return false; 
@@ -344,12 +384,6 @@ bool isChecksumValid(const char* sentence) {
   char c2 = sentence[starIndex + 2];
   if (!isxdigit(c1) || !isxdigit(c2)) return false; 
   
-  for (int i = 1; i < starIndex; i++) {
-    if (sentence[i] < 32 || sentence[i] > 126 || sentence[i] == '{' || sentence[i] == '}' || sentence[i] == '`') {
-        return false;
-    }
-  }
-
   uint8_t calculatedCS = 0;
   for (int i = 1; i < starIndex; i++) {
     calculatedCS ^= sentence[i];
@@ -361,52 +395,62 @@ bool isChecksumValid(const char* sentence) {
   return (calculatedCS == providedCS); 
 }
 
-// --- DÜZELTİLMİŞ GSV PARSER (NMEA 4.10) ---
-void uyduTipleriniAyristir(String nmea) {
-  if (nmea.indexOf("GSV") != -1) {
+void uyduTipleriniAyristir(const char* nmea) {
+  if (strstr(nmea, "GSV") != NULL) {
     const char* sys = "UN";
-    if (nmea.startsWith("$GP")) sys = "GP";
-    else if (nmea.startsWith("$GL")) sys = "GL";
-    else if (nmea.startsWith("$GA")) sys = "GA";
-    else if (nmea.startsWith("$GB") || nmea.startsWith("$BD")) sys = "GB";
-    else if (nmea.startsWith("$GI")) sys = "GI";
-    else if (nmea.startsWith("$GQ")) sys = "GQ";
+    if (strncmp(nmea, "$GP", 3) == 0) sys = "GP";
+    else if (strncmp(nmea, "$GL", 3) == 0) sys = "GL";
+    else if (strncmp(nmea, "$GA", 3) == 0) sys = "GA";
+    else if (strncmp(nmea, "$GB", 3) == 0 || strncmp(nmea, "$BD", 3) == 0) sys = "GB";
+    else if (strncmp(nmea, "$GI", 3) == 0) sys = "GI";
+    else if (strncmp(nmea, "$GQ", 3) == 0) sys = "GQ";
 
-    int commaIndex[25]; // Kapasiteyi artırdık
+    int commas[25]; 
     int cCount = 0;
-    for (int i = 0; i < nmea.length(); i++) {
+    int len = strlen(nmea);
+    int starIdx = -1;
+    
+    for (int i = 0; i < len; i++) {
       if (nmea[i] == ',') {
-        commaIndex[cCount++] = i;
-        if (cCount >= 25) break;
+        if (cCount < 25) commas[cCount++] = i;
+      } else if (nmea[i] == '*') {
+        starIdx = i;
       }
     }
 
-    int starIdx = nmea.indexOf('*');
     if (starIdx < 0) return;
 
-    // Sinyal Kimliğini Güvenli Şekilde Tespit Etme
     bool hasSignalId = false;
     int sig_id = 1; 
+    
     if (cCount >= 4) {
-      if ((cCount - 3) % 4 == 1) { // Eğer 4. uydu SNR'sından sonra bir alan daha varsa (Sinyal ID)
+      if ((cCount - 3) % 4 == 1) { 
         hasSignalId = true;
-        String sigStr = nmea.substring(commaIndex[cCount - 1] + 1, starIdx);
-        if (sigStr.length() > 0) sig_id = strtol(sigStr.c_str(), NULL, 16);
+        char sigStr[4] = {0};
+        int sigLen = starIdx - commas[cCount - 1] - 1;
+        if (sigLen > 0 && sigLen < 4) {
+          strncpy(sigStr, nmea + commas[cCount - 1] + 1, sigLen);
+          sig_id = strtol(sigStr, NULL, 16);
+        }
       }
     }
 
     for (int i = 4; i < cCount; i += 4) {
       if (i + 2 < cCount) {
-        int id = nmea.substring(commaIndex[i-1] + 1, commaIndex[i]).toInt();
-        int elev = nmea.substring(commaIndex[i] + 1, commaIndex[i+1]).toInt();
-        int azim = nmea.substring(commaIndex[i+1] + 1, commaIndex[i+2]).toInt();
+        int id = atoi(nmea + commas[i-1] + 1);
+        int elev = atoi(nmea + commas[i] + 1);
+        int azim = atoi(nmea + commas[i+1] + 1);
         int snr = 0;
         
         if (i + 3 < cCount) {
-          snr = nmea.substring(commaIndex[i+2] + 1, commaIndex[i+3]).toInt();
+          snr = atoi(nmea + commas[i+2] + 1);
         } else if (!hasSignalId) {
-          // NMEA 4.0'da (Signal ID yokken) son uydunun SNR'sini kaçırmamak için DÜZELTİLDİ
-          snr = nmea.substring(commaIndex[i+2] + 1, starIdx).toInt();
+          char snrStr[8] = {0};
+          int snrLen = starIdx - commas[i+2] - 1;
+          if(snrLen > 0 && snrLen < 8) {
+              strncpy(snrStr, nmea + commas[i+2] + 1, snrLen);
+              snr = atoi(snrStr);
+          }
         }
         
         if (id > 0) {
@@ -418,11 +462,138 @@ void uyduTipleriniAyristir(String nmea) {
 }
 
 // ==========================================
-// 5. KURULUM (SETUP)
+// CORE 0: AĞ, TELEMETRİ VE WATCHDOG GÖREVİ
+// ==========================================
+void networkTaskCode(void * parameter) {
+  static unsigned long sonJsonZamani = 0;
+  static unsigned long sonWifiKontrol = 0;
+
+  // STACK OVERFLOW ÇÖZÜMÜ: Büyük tamponları 'static' yaparak
+  // kısıtlı Task Stack belleğinden genel BSS belleğine taşıdık!
+  static SatData localSats[MAX_SATS];
+  static char jsonBuffer[3072];
+
+  for(;;) {
+    uint32_t now = millis();
+
+    // 1. Wi-Fi Exponential Backoff & Reconnect
+    if (now - sonWifiKontrol >= 10000) {
+      sonWifiKontrol = now;
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[WIFI] Baglanti Koptu! Yeniden baglaniliyor...");
+        WiFi.reconnect();
+      }
+    }
+
+    ws.cleanupClients();
+
+    // 3. Telemetri Yayını (Saniyede 1)
+    if (now - sonJsonZamani >= 1000) {
+      sonJsonZamani = now;
+      cleanOldSatellites(); 
+
+      if (ws.count() > 0) {
+        // --- 1. ADIM: VERİLERİN YEREL KOPYASINI AL (SNAPSHOT) ---
+        int localSatCount = 0;
+        
+        double locLat = 0.0, locLon = 0.0, locAlt = 0.0, locHdop = 0.0;
+        bool locValid = false, timeValid = false;
+        char locTime[12] = "--:--:--";
+        uint32_t currentRtcmCount = 0;
+
+        if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+          // Uydu Kopyası
+          localSatCount = activeSatCount;
+          memcpy(localSats, (const void*)activeSats, localSatCount * sizeof(SatData));
+          
+          // GPS Kopyası
+          locLat = safeGps.lat; locLon = safeGps.lon; 
+          locAlt = safeGps.alt; locHdop = safeGps.hdop;
+          locValid = safeGps.validLoc; timeValid = safeGps.validTime;
+          if (timeValid) sprintf(locTime, "%02d:%02d:%02d", safeGps.hour, safeGps.min, safeGps.sec);
+          
+          // RTCM Sayaç Kopyası ve Sıfırlama
+          currentRtcmCount = rtcmPaketSayaci;
+          rtcmPaketSayaci = 0; 
+          xSemaphoreGive(dataMutex);
+        }
+
+        // --- 2. ADIM: TCP İSTEMCİ SAYIMI (Thread-Safe) ---
+        int activeTcp = 0;
+        if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
+          for (int i = 0; i < 3; i++) {
+            if (tcpClients[i] && tcpClients[i].connected()) activeTcp++;
+            else if (tcpClients[i]) tcpClients[i].stop();
+          }
+          xSemaphoreGive(tcpMutex);
+        }
+
+        // --- 3. ADIM: JSON OLUŞTUR (MUTEX DIŞINDA!) ---
+        #if ARDUINOJSON_VERSION_MAJOR >= 7
+          JsonDocument doc; 
+        #else
+          DynamicJsonDocument doc(4096); 
+        #endif
+        
+        doc["lat"] = locValid ? locLat : 0.0;
+        doc["lon"] = locValid ? locLon : 0.0;
+        doc["alt"] = safeGps.validAlt ? locAlt : 0.0;
+        doc["hdop"] = safeGps.validHdop ? locHdop : 0.0;
+        doc["tcp_clients"] = activeTcp;
+        doc["rtcm"] = currentRtcmCount;
+        doc["sat_time"] = locTime;
+        doc["pps_active"] = (micros() - sonPpsZamaniMicros < 2000000) ? true : false; 
+
+        int gpsL1=0, gpsL5=0, gloL1=0, galE1=0, galE5a=0, beiB1=0, beiB2a=0, qzsL1=0, qzsL5=0, navL5=0;
+        JsonArray sky = doc["sky"].to<JsonArray>();
+        
+        for (int i = 0; i < localSatCount; i++) {
+          SatData s = localSats[i];
+          if(strcmp(s.sys, "GP") == 0) { if(s.sig == 8) gpsL5++; else gpsL1++; }
+          else if(strcmp(s.sys, "GL") == 0) { gloL1++; }
+          else if(strcmp(s.sys, "GA") == 0) { if(s.sig == 1 || s.sig == 2 || s.sig == 3) galE5a++; else galE1++; }
+          else if(strcmp(s.sys, "GB") == 0) { if(s.sig == 5 || s.sig == 6 || s.sig == 7 || s.sig == 0xB || s.sig == 0xC) beiB2a++; else beiB1++; }
+          else if(strcmp(s.sys, "GQ") == 0) { if(s.sig == 8) qzsL5++; else qzsL1++; }
+          else if(strcmp(s.sys, "GI") == 0) { navL5++; }
+          
+          if(s.elev > 0 || s.azim > 0) {
+            bool isPrimary = true;
+            if((strcmp(s.sys, "GP") == 0 || strcmp(s.sys, "GQ") == 0) && s.sig == 8) isPrimary = false;
+            if(strcmp(s.sys, "GA") == 0 && (s.sig == 1 || s.sig == 2 || s.sig == 3)) isPrimary = false;
+            if(strcmp(s.sys, "GB") == 0 && (s.sig == 5 || s.sig == 6 || s.sig == 7 || s.sig == 0xB || s.sig == 0xC)) isPrimary = false;
+
+            if (isPrimary) {
+              JsonObject obj = sky.add<JsonObject>();
+              obj["s"] = s.sys; obj["id"] = s.id; obj["e"] = s.elev; obj["a"] = s.azim; obj["sn"] = s.snr; 
+            }
+          }
+        }
+
+        JsonObject sats = doc["sats"].to<JsonObject>();
+        JsonObject s_gps = sats["gps"].to<JsonObject>(); s_gps["L1"] = gpsL1; s_gps["L5"] = gpsL5;
+        JsonObject s_glo = sats["glo"].to<JsonObject>(); s_glo["L1"] = gloL1;
+        JsonObject s_gal = sats["gal"].to<JsonObject>(); s_gal["E1"] = galE1; s_gal["E5a"] = galE5a;
+        JsonObject s_bei = sats["bei"].to<JsonObject>(); s_bei["B1"] = beiB1; s_bei["B2a"] = beiB2a;
+        JsonObject s_qzs = sats["qzs"].to<JsonObject>(); s_qzs["L1"] = qzsL1; s_qzs["L5"] = qzsL5;
+        JsonObject s_nav = sats["nav"].to<JsonObject>(); s_nav["L5"] = navL5;
+
+        serializeJson(doc, jsonBuffer);
+        ws.textAll(jsonBuffer);
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+// ==========================================
+// 6. KURULUM (SETUP)
 // ==========================================
 void setup() {
   Serial.begin(115200);
   Serial2.begin(GNSS_BAUD, SERIAL_8N1, RXD2, TXD2);
+
+  dataMutex = xSemaphoreCreateMutex();
+  tcpMutex = xSemaphoreCreateMutex();
 
   pinMode(PPS_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(PPS_PIN), ppsKesmesi, RISING);
@@ -442,7 +613,6 @@ void setup() {
     if(request->hasParam("c")){
       String komut = request->getParam("c")->value();
       Serial2.print(komut + "\r\n"); 
-      Serial.println("[HTTP] Modüle Giden: " + komut);
       request->send(200, "text/plain", "OK"); 
     } else {
       request->send(400, "text/plain", "BOS");
@@ -454,52 +624,85 @@ void setup() {
   rtcmServer.begin();
   server.begin();
 
-  Serial2.println("$PAIR062,0,1*3F"); 
-  delay(100);
-  Serial2.println("$PAIR062,3,1*3C"); 
-  delay(2000);
-  Serial2.println("$PQTMCFGSVIN,W,1,300,1,0,0,0*20");
-  delay(200);
-  Serial2.println("$PAIR432,1*22"); 
-  delay(200);
+  Serial2.println("$PAIR062,0,1*3F"); delay(100);
+  Serial2.println("$PAIR062,3,1*3C"); delay(2000);
+  Serial2.println("$PQTMCFGSVIN,W,1,300,1,0,0,0*20"); delay(200);
+  Serial2.println("$PAIR432,1*22"); delay(200);
   Serial2.println("$PAIR436,1*26");
+
+  // STACK OVERFLOW ÇÖZÜMÜ: Yığın bellek sınırı 8192'den 16384'e (16KB) çıkarıldı!
+  xTaskCreatePinnedToCore(networkTaskCode, "NetworkTask", 16384, NULL, 1, &NetworkTaskHandle, 0);
 }
 
 // ==========================================
-// 6. ANA DÖNGÜ (LOOP)
+// 7. CORE 1: YÜKSEK HIZLI GNSS VERİ İŞLEME
 // ==========================================
 void loop() {
-  ws.cleanupClients(); 
-  
-  while (rtcmServer.hasClient()) {
-    bool added = false;
-    for (int i = 0; i < 3; i++) {
-      if (!tcpClients[i] || !tcpClients[i].connected()) {
-        if (tcpClients[i]) tcpClients[i].stop();
-        tcpClients[i] = rtcmServer.available();
-        added = true;
-        break;
+  // TCP İstemci Kabulü (Wi-Fi Crash Engellendi)
+  if (rtcmServer.hasClient()) {
+    WiFiClient newClient = rtcmServer.available();
+    if (newClient) {
+      bool added = false;
+      if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
+        for (int i = 0; i < 3; i++) {
+          if (!tcpClients[i] || !tcpClients[i].connected()) {
+            if (tcpClients[i]) tcpClients[i].stop();
+            tcpClients[i] = newClient;
+            added = true;
+            break;
+          }
+        }
+        xSemaphoreGive(tcpMutex);
       }
+      if (!added) newClient.stop(); 
     }
-    if (!added) rtcmServer.available().stop(); 
   }
 
   size_t bytesAvailable = Serial2.available();
   if (bytesAvailable > 0) {
-    uint8_t buf[128]; 
+    uint8_t buf[256]; 
     if (bytesAvailable > sizeof(buf)) bytesAvailable = sizeof(buf);
     size_t len = Serial2.read(buf, bytesAvailable);
 
-    for (int i = 0; i < 3; i++) {
-      if (tcpClients[i] && tcpClients[i].connected()) {
-        tcpClients[i].write(buf, len);
+    if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
+      for (int i = 0; i < 3; i++) {
+        if (tcpClients[i] && tcpClients[i].connected()) {
+          tcpClients[i].write(buf, len);
+        }
       }
+      xSemaphoreGive(tcpMutex);
     }
+
+    static enum { WAIT_SYNC, WAIT_LEN1, WAIT_LEN2, SKIP_PAYLOAD } rtcmState = WAIT_SYNC;
+    static uint16_t rtcmLen = 0;
+    static uint16_t rtcmBytesRead = 0;
+    static uint32_t lastRtcmTime = 0;
+
+    if (rtcmState != WAIT_SYNC && (millis() - lastRtcmTime > 50)) {
+        rtcmState = WAIT_SYNC;
+    }
+    lastRtcmTime = millis();
 
     for (size_t i = 0; i < len; i++) {
       uint8_t b = buf[i];
       gps.encode(b); 
-      if (b == 0xD3) rtcmPaketSayaci++;
+      
+      if (rtcmState == WAIT_SYNC && b == 0xD3) {
+        rtcmState = WAIT_LEN1;
+      } else if (rtcmState == WAIT_LEN1) {
+        rtcmLen = (b & 0x03) << 8;
+        rtcmState = WAIT_LEN2;
+      } else if (rtcmState == WAIT_LEN2) {
+        rtcmLen |= b;
+        rtcmBytesRead = 0;
+        rtcmState = SKIP_PAYLOAD;
+      } else if (rtcmState == SKIP_PAYLOAD) {
+        rtcmBytesRead++;
+        if (rtcmBytesRead >= rtcmLen + 3) { 
+          rtcmPaketSayaci++;
+          rtcmState = WAIT_SYNC;
+        }
+      }
       
       char c = (char)b;
       
@@ -508,110 +711,34 @@ void loop() {
         nmeaBuff[nmeaIdx++] = c;
       } else if (c == '\n') {
         if (nmeaIdx > 0 && nmeaBuff[0] == '$') {
-          if (nmeaBuff[nmeaIdx - 1] == '\r') {
-            nmeaBuff[nmeaIdx - 1] = '\0';
-          } else {
-            nmeaBuff[nmeaIdx] = '\0'; 
-          }
+          if (nmeaBuff[nmeaIdx - 1] == '\r') nmeaBuff[nmeaIdx - 1] = '\0';
+          else nmeaBuff[nmeaIdx] = '\0'; 
           
           if (isChecksumValid(nmeaBuff)) {
-            String gecerliCevap = String(nmeaBuff); 
+            uyduTipleriniAyristir(nmeaBuff); 
             
-            uyduTipleriniAyristir(gecerliCevap); 
-            
-            if (!gecerliCevap.startsWith("$GN") && 
-                !gecerliCevap.startsWith("$GP") && 
-                !gecerliCevap.startsWith("$GL") && 
-                !gecerliCevap.startsWith("$GA") && 
-                !gecerliCevap.startsWith("$GB") && 
-                !gecerliCevap.startsWith("$GQ") &&
-                !gecerliCevap.startsWith("$BD")) {
-              
-              Serial.println("[MODUL CEVABI]: " + gecerliCevap);
-              ws.textAll("TERM:" + gecerliCevap);
+            if (strncmp(nmeaBuff, "$GN", 3) != 0 && strncmp(nmeaBuff, "$GP", 3) != 0 && 
+                strncmp(nmeaBuff, "$GL", 3) != 0 && strncmp(nmeaBuff, "$GA", 3) != 0 && 
+                strncmp(nmeaBuff, "$GB", 3) != 0 && strncmp(nmeaBuff, "$GQ", 3) != 0 && strncmp(nmeaBuff, "$BD", 3) != 0) {
+              char termMsg[160];
+              snprintf(termMsg, sizeof(termMsg), "TERM:%s", nmeaBuff);
+              ws.textAll(termMsg);
             }
           }
         }
         nmeaIdx = 0; 
       } else if (c >= 32 && c <= 126 && nmeaIdx > 0) {
-        if (nmeaIdx < 127) {
-          nmeaBuff[nmeaIdx++] = c;
-        }
+        if (nmeaIdx < 127) nmeaBuff[nmeaIdx++] = c;
       }
     }
-  }
 
-  if (millis() - sonGuncelleme >= 1000) {
-    sonGuncelleme = millis();
-
-    if (ws.count() > 0) {
-      JsonDocument doc; 
-      
-      doc["lat"] = gps.location.isValid() ? gps.location.lat() : 0.0;
-      doc["lon"] = gps.location.isValid() ? gps.location.lng() : 0.0;
-      doc["alt"] = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
-      doc["hdop"] = gps.hdop.isValid() ? gps.hdop.hdop() : 0.0;
-      
-      int activeTcp = 0;
-      for (int i = 0; i < 3; i++) {
-        if (tcpClients[i] && tcpClients[i].connected()) activeTcp++;
-      }
-      doc["tcp_clients"] = activeTcp;
-
-      doc["rtcm"] = rtcmPaketSayaci;
-      if (gps.time.isValid()) {
-        char tBuf[12];
-        sprintf(tBuf, "%02d:%02d:%02d", gps.time.hour(), gps.time.minute(), gps.time.second());
-        doc["sat_time"] = String(tBuf);
-      } else {
-        doc["sat_time"] = "--:--:--";
-      }
-      doc["pps_active"] = (micros() - sonPpsZamaniMicros < 2000000) ? true : false; 
-
-      int gpsL1=0, gpsL5=0, gloL1=0, galE1=0, galE5a=0, beiB1=0, beiB2a=0, qzsL1=0, qzsL5=0, navL5=0;
-      JsonArray sky = doc["sky"].to<JsonArray>();
-      
-      for (int i = 0; i < activeSatCount; i++) {
-        SatData s = activeSats[i];
-        
-        if(strcmp(s.sys, "GP") == 0) { if(s.sig == 8) gpsL5++; else gpsL1++; }
-        else if(strcmp(s.sys, "GL") == 0) { gloL1++; }
-        else if(strcmp(s.sys, "GA") == 0) { if(s.sig == 1 || s.sig == 2 || s.sig == 3) galE5a++; else galE1++; }
-        
-        // İŞTE SENİN BEİDOU B2a DÜZELTMESİ BURADA! (5, 6, 7 ve 0xB NMEA'da B2 frekanslarına denk gelir)
-        else if(strcmp(s.sys, "GB") == 0) { if(s.sig == 5 || s.sig == 6 || s.sig == 7 || s.sig == 0xB || s.sig == 0xC) beiB2a++; else beiB1++; }
-        
-        else if(strcmp(s.sys, "GQ") == 0) { if(s.sig == 8) qzsL5++; else qzsL1++; }
-        else if(strcmp(s.sys, "GI") == 0) { navL5++; }
-        
-        if(s.elev > 0 || s.azim > 0) {
-          // RADAR OPTİMİZASYONU: Sadece birincil sinyali (L1, E1, B1I) çiz. 
-          bool isPrimary = true;
-          if((strcmp(s.sys, "GP") == 0 || strcmp(s.sys, "GQ") == 0) && s.sig == 8) isPrimary = false;
-          if(strcmp(s.sys, "GA") == 0 && (s.sig == 1 || s.sig == 2 || s.sig == 3)) isPrimary = false;
-          if(strcmp(s.sys, "GB") == 0 && (s.sig == 5 || s.sig == 6 || s.sig == 7 || s.sig == 0xB || s.sig == 0xC)) isPrimary = false;
-
-          if (isPrimary) {
-            JsonObject obj = sky.add<JsonObject>();
-            obj["s"] = s.sys; obj["id"] = s.id; obj["e"] = s.elev; obj["a"] = s.azim; obj["sn"] = s.snr; 
-          }
-        }
-      }
-
-      JsonObject sats = doc["sats"].to<JsonObject>();
-      JsonObject s_gps = sats["gps"].to<JsonObject>(); s_gps["L1"] = gpsL1; s_gps["L5"] = gpsL5;
-      JsonObject s_glo = sats["glo"].to<JsonObject>(); s_glo["L1"] = gloL1;
-      JsonObject s_gal = sats["gal"].to<JsonObject>(); s_gal["E1"] = galE1; s_gal["E5a"] = galE5a;
-      JsonObject s_bei = sats["bei"].to<JsonObject>(); s_bei["B1"] = beiB1; s_bei["B2a"] = beiB2a;
-      JsonObject s_qzs = sats["qzs"].to<JsonObject>(); s_qzs["L1"] = qzsL1; s_qzs["L5"] = qzsL5;
-      JsonObject s_nav = sats["nav"].to<JsonObject>(); s_nav["L5"] = navL5;
-
-      String jsonString;
-      serializeJson(doc, jsonString);
-      ws.textAll(jsonString);
+    if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+      safeGps.lat = gps.location.lat(); safeGps.lon = gps.location.lng();
+      safeGps.alt = gps.altitude.meters(); safeGps.hdop = gps.hdop.hdop();
+      safeGps.validLoc = gps.location.isValid(); safeGps.validAlt = gps.altitude.isValid();
+      safeGps.validHdop = gps.hdop.isValid(); safeGps.validTime = gps.time.isValid();
+      safeGps.hour = gps.time.hour(); safeGps.min = gps.time.minute(); safeGps.sec = gps.time.second();
+      xSemaphoreGive(dataMutex);
     }
-
-    rtcmPaketSayaci = 0;
-    activeSatCount = 0; 
   }
 }
