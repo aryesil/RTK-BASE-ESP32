@@ -297,7 +297,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                     finalCmd = cmd + '*' + hexCS;
                 }
                 fetch('/cmd?c=' + encodeURIComponent(finalCmd))
-                .then(response => { if(response.ok) logTerminal("<span style='color:#fff; font-weight:bold;'>TX:</span> <span style='color:#00ffcc;'>" + finalCmd + "</span>"); })
+                .then(response => { if(response.ok) logTerminal("<span style='color:#33ff33; font-weight:bold;'>TX:</span> <span style='color:#00ffcc;'>" + finalCmd + "</span>"); })
                 .catch(error => { logTerminal("<span style='color:#ff3333;'>HATA: Modüle ulaşılamadı!</span>"); });
                 cmdInput.value = ""; 
             }
