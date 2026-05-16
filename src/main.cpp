@@ -55,10 +55,15 @@ struct GpsSnapshot {
   double lat, lon, alt, hdop;
   bool validLoc, validAlt, validHdop, validTime;
   uint8_t hour, min, sec;
+  uint8_t fixQual; 
 } safeGps;
 
 volatile uint32_t rtcmPaketSayaci = 0;
 volatile uint32_t sonPpsZamaniMicros = 0; 
+volatile uint8_t globalFixQuality = 0; 
+
+// Çekirdek İşlemci Yükü Takibi İçin Sayaçlar
+volatile uint32_t core1BusyTime = 0; 
 
 #define MAX_NMEA 256
 char nmeaBuff[MAX_NMEA];
@@ -149,7 +154,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         h2 { text-align: center; color: #fff; margin-bottom: 5px; }
         .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
         @media (max-width: 768px) { .grid { grid-template-columns: 1fr; } }
-        .card { background: #1e1e1e; padding: 15px; border-radius: 8px; border: 1px solid #333; }
+        .card { background: #1e1e1e; padding: 15px; border-radius: 8px; border: 1px solid #333; position: relative; }
         .card h3 { margin-top: 0; color: #aaa; font-size: 14px; border-bottom: 1px solid #444; padding-bottom: 5px;}
         .value { font-size: 18px; color: #fff; font-weight: bold; }
         .alert { color: #ff3333; }
@@ -174,6 +179,9 @@ const char index_html[] PROGMEM = R"rawliteral(
             <div>Boylam: <span id="lon" class="value">Bekleniyor...</span></div>
             <div>İrtifa: <span id="alt" class="value">0.0</span> m</div>
             <div>HDOP: <span id="hdop" class="value">0.0</span></div>
+            <hr style="border: 0; border-top: 1px solid #444; margin: 10px 0;">
+            <div>Fix Mode: <span id="f_mode" class="value alert">NO FIX</span></div>
+            <div>Fix Quality: <span id="f_qual" class="value alert" style="font-size: 16px;">INVALID</span></div>
             <hr style="border: 0; border-top: 1px solid #444; margin: 10px 0;">
             <div>PPS Durumu: <span id="pps_status" class="value alert">KİLİT YOK</span></div>
             <div>Uydu Saati (UTC): <span id="sat_time" class="value" style="color:#aaffaa">--:--:--</span></div>
@@ -225,6 +233,11 @@ const char index_html[] PROGMEM = R"rawliteral(
                     <div class="sat-sig-row"><span>L1:</span><span class="val" id="sba-l1" style="color:#ffffff;">0</span></div>
                 </div>
             </div>
+            
+            <div style="text-align: right; font-size: 11px; color: #888; margin-top: 5px; padding-right: 5px;">
+                CPU Yükü -> C0(Ağ): <span id="cpu0_usage" style="color: #00ffcc; font-weight: bold;">0%</span> | C1(GNSS): <span id="cpu1_usage" style="color: #00ffcc; font-weight: bold;">0%</span>
+            </div>
+
             <h3 style="margin-top: 15px;">🌌 SKYVIEW (Canlı Radar)</h3>
             <canvas id="skyview" width="500" height="500"></canvas>
         </div>
@@ -241,7 +254,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             "GP": "https://flagcdn.com/w40/us.png", "GL": "https://flagcdn.com/w40/ru.png", 
             "GA": "https://flagcdn.com/w40/eu.png", "GB": "https://flagcdn.com/w40/cn.png", 
             "GI": "https://flagcdn.com/w40/in.png", "GQ": "https://flagcdn.com/w40/jp.png",
-            "SB": "https://flagcdn.com/w40/eu.png" 
+            "SB": "https://flagcdn.com/w40/eu.png"
         };
         for(let key in flagUrls){ let img = new Image(); img.src = flagUrls[key]; flags[key] = img; }
 
@@ -353,6 +366,34 @@ const char index_html[] PROGMEM = R"rawliteral(
                 document.getElementById('tcp_clients').innerText = data.tcp_clients;
                 if(data.sat_time) document.getElementById('sat_time').innerText = data.sat_time;
                 
+                if(data.f_mode) {
+                    var fModeEl = document.getElementById('f_mode');
+                    fModeEl.innerText = data.f_mode;
+                    fModeEl.className = (data.f_mode === "3D" || data.f_mode === "2D") ? "value good" : "value alert";
+
+                    var fQualEl = document.getElementById('f_qual');
+                    fQualEl.innerText = data.f_qual;
+                    
+                    if (data.f_qual.includes("RTK FIXED")) fQualEl.style.color = "#c688ff"; 
+                    else if (data.f_qual.includes("RTK FLOAT") || data.f_qual.includes("DGNSS")) fQualEl.style.color = "#00ffcc";
+                    else if (data.f_qual.includes("GPS")) fQualEl.style.color = "#ffdd00";
+                    else fQualEl.style.color = "#ff3333";
+                }
+
+                if(data.cpu0 !== undefined && data.cpu1 !== undefined) {
+                    var cpu0El = document.getElementById('cpu0_usage');
+                    cpu0El.innerText = data.cpu0 + '%';
+                    if (data.cpu0 > 80) cpu0El.style.color = "#ff3333"; 
+                    else if (data.cpu0 > 50) cpu0El.style.color = "#ffdd00"; 
+                    else cpu0El.style.color = "#00ffcc"; 
+
+                    var cpu1El = document.getElementById('cpu1_usage');
+                    cpu1El.innerText = data.cpu1 + '%';
+                    if (data.cpu1 > 80) cpu1El.style.color = "#ff3333"; 
+                    else if (data.cpu1 > 50) cpu1El.style.color = "#ffdd00"; 
+                    else cpu1El.style.color = "#00ffcc"; 
+                }
+
                 var ppsEl = document.getElementById('pps_status');
                 if(data.pps_active) {
                     ppsEl.innerText = "AKTİF (KİLİTLİ)"; ppsEl.className = "value good";
@@ -520,12 +561,12 @@ void uyduTipleriniAyristir(const char* nmea) {
 void networkTaskCode(void * parameter) {
   static unsigned long sonJsonZamani = 0;
   static unsigned long sonWifiKontrol = 0;
-
   static SatData localSats[MAX_SATS];
-  
   static char jsonBuffer[8192]; 
+  static uint32_t core0BusyTimeAcc = 0; 
 
   for(;;) {
+    uint32_t c0TaskStart = micros();
     uint32_t now = millis();
 
     if (now - sonWifiKontrol >= 10000) {
@@ -544,8 +585,7 @@ void networkTaskCode(void * parameter) {
     char queuedMsg[160];
     while (xQueueReceive(termQueue, queuedMsg, 0) == pdTRUE) {
       if (ws.count() > 0) {
-        // HATA FIX: Iterator Kütüphane Uyumluluğu ve Backpressure
-        ws.textAll(queuedMsg);
+        ws.textAll(queuedMsg); 
       }
     }
 
@@ -561,6 +601,7 @@ void networkTaskCode(void * parameter) {
         char locTime[12] = "--:--:--";
         uint32_t currentRtcmCount = 0;
         uint32_t lastPps = 0;
+        uint8_t locFixQual = 0;
 
         if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
           localSatCount = activeSatCount;
@@ -572,6 +613,7 @@ void networkTaskCode(void * parameter) {
           locValidAlt = safeGps.validAlt;
           locValidHdop = safeGps.validHdop; 
           locTimeValid = safeGps.validTime;
+          locFixQual = safeGps.fixQual;
 
           if (locTimeValid) sprintf(locTime, "%02d:%02d:%02d", safeGps.hour, safeGps.min, safeGps.sec);
           
@@ -585,6 +627,16 @@ void networkTaskCode(void * parameter) {
         lastPps = sonPpsZamaniMicros;
         portEXIT_CRITICAL(&ppsMux);
 
+        uint32_t c1Busy = core1BusyTime;
+        core1BusyTime = 0; 
+        int cpu1Usage = (c1Busy * 100) / 1000000;
+        if(cpu1Usage > 100) cpu1Usage = 100;
+
+        uint32_t c0Busy = core0BusyTimeAcc;
+        core0BusyTimeAcc = 0; 
+        int cpu0Usage = (c0Busy * 100) / 1000000;
+        if(cpu0Usage > 100) cpu0Usage = 100;
+
         int activeTcp = 0;
         if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
           for (int i = 0; i < 3; i++) {
@@ -595,6 +647,21 @@ void networkTaskCode(void * parameter) {
             }
           }
           xSemaphoreGive(tcpMutex);
+        }
+
+        const char* modeStr = "NO FIX";
+        if (locValidLoc && locFixQual > 0) {
+            modeStr = locValidAlt ? "3D" : "2D";
+        }
+        
+        const char* qualStr = "INVALID";
+        switch(locFixQual) {
+            case 1: qualStr = "GPS FIX"; break;
+            case 2: qualStr = "DGNSS"; break;
+            case 3: qualStr = "PPS FIX"; break;
+            case 4: qualStr = "RTK FIXED"; break;
+            case 5: qualStr = "RTK FLOAT"; break;
+            case 6: qualStr = "ESTIMATED"; break;
         }
 
         #if ARDUINOJSON_VERSION_MAJOR >= 7
@@ -612,6 +679,11 @@ void networkTaskCode(void * parameter) {
         doc["rtcm"] = currentRtcmCount;
         doc["sat_time"] = locTime;
         doc["pps_active"] = (micros() - lastPps < 2000000) ? true : false; 
+        
+        doc["f_mode"] = modeStr;
+        doc["f_qual"] = qualStr;
+        doc["cpu0"] = cpu0Usage; 
+        doc["cpu1"] = cpu1Usage; 
 
         int gpsL1=0, gpsL5=0, gloL1=0, galE1=0, galE5a=0, beiB1=0, beiB2a=0, qzsL1=0, qzsL5=0, navL5=0, sbaL1=0;
         JsonArray sky = doc["sky"].to<JsonArray>();
@@ -651,10 +723,15 @@ void networkTaskCode(void * parameter) {
 
         serializeJson(doc, jsonBuffer);
         
-        // HATA FIX: Iterator Kütüphane Uyumluluğu. 
         ws.textAll(jsonBuffer);
       }
     }
+    
+    uint32_t c0TaskEnd = micros();
+    if (c0TaskEnd >= c0TaskStart) {
+        core0BusyTimeAcc += (c0TaskEnd - c0TaskStart);
+    }
+    
     vTaskDelay(pdMS_TO_TICKS(20)); 
   }
 }
@@ -664,6 +741,9 @@ void networkTaskCode(void * parameter) {
 // ==========================================
 void setup() {
   Serial.begin(115200);
+  
+  // YENİ: TCP Gecikmelerinde Veri Kaybını Önlemek İçin UART Donanım Hafızası Büyütüldü (2048 Byte)
+  Serial2.setRxBufferSize(2048);
   Serial2.begin(GNSS_BAUD, SERIAL_8N1, RXD2, TXD2);
 
   dataMutex = xSemaphoreCreateMutex();
@@ -680,7 +760,6 @@ void setup() {
   Serial.println("\nBAGLANDI! Tarayicinizdan su adrese gidin:");
   Serial.println(WiFi.localIP());
 
-  // HATA 1 FIX: send_P komutu ESPAsyncWebServer güncel sürümlerinde send olarak değiştirildi
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
    request->send(200, "text/html", index_html);
   });
@@ -725,9 +804,14 @@ void setup() {
 // 7. CORE 1: YÜKSEK HIZLI GNSS VERİ İŞLEME
 // ==========================================
 void loop() {
+  uint32_t loopStart = micros();
+
   if (rtcmServer.hasClient()) {
     WiFiClient newClient = rtcmServer.available();
     if (newClient) {
+      // YENİ: TCP Gecikmesini (Latency) Sıfırlamak İçin Nagle Algoritması Kapatıldı
+      newClient.setNoDelay(true); 
+      
       bool added = false;
       if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
         for (int i = 0; i < 3; i++) {
@@ -748,15 +832,14 @@ void loop() {
   if (bytesAvailable > 0) {
     uint8_t buf[256]; 
     if (bytesAvailable > sizeof(buf)) bytesAvailable = sizeof(buf);
+    
     size_t len = Serial2.read(buf, bytesAvailable);
 
+    // YENİ DÜZEN: Agresif Koruma Kaldırıldı. TCP Yayını Hiçbir Filtreye Girmeden Çalışır!
     if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
       for (int i = 0; i < 3; i++) {
-        if (tcpClients[i].connected() && tcpClients[i].availableForWrite() >= len) {
-          size_t written = tcpClients[i].write(buf, len);
-          if (written < len) {
-              tcpClients[i].stop();
-          }
+        if (tcpClients[i].connected()) {
+          tcpClients[i].write(buf, len);
         }
       }
       xSemaphoreGive(tcpMutex);
@@ -776,7 +859,6 @@ void loop() {
     for (size_t i = 0; i < len; i++) {
       uint8_t b = buf[i];
       
-      // Binary RTCM Verileri TinyGPS++ ve NMEA ayrıştırıcıdan YALITILDI!
       if (rtcmState == WAIT_SYNC && b == 0xD3) {
         rtcmState = WAIT_LEN1;
         rtcmBytesRead = 1;
@@ -799,7 +881,6 @@ void loop() {
           rtcmState = WAIT_SYNC;
         }
       } else {
-        // --- BURASI SADECE ASCII NMEA VERİLERİ İÇİNDİR ---
         gps.encode(b); 
         char c = (char)b;
         
@@ -812,6 +893,21 @@ void loop() {
             else nmeaBuff[nmeaIdx] = '\0'; 
             
             if (isChecksumValid(nmeaBuff)) {
+              
+              if (strncmp(nmeaBuff + 3, "GGA,", 4) == 0) {
+                  int commas[10];
+                  int cCount = 0;
+                  for (int k = 0; nmeaBuff[k] != '\0' && cCount < 10; k++) {
+                      if (nmeaBuff[k] == ',') commas[cCount++] = k;
+                  }
+                  if (cCount >= 6) {
+                      char qChar = nmeaBuff[commas[5] + 1];
+                      if (qChar >= '0' && qChar <= '9') {
+                          globalFixQuality = qChar - '0';
+                      }
+                  }
+              }
+
               uyduTipleriniAyristir(nmeaBuff); 
               
               if (strncmp(nmeaBuff, "$GN", 3) != 0 && strncmp(nmeaBuff, "$GP", 3) != 0 && 
@@ -823,7 +919,7 @@ void loop() {
                 char termMsg[160];
                 snprintf(termMsg, sizeof(termMsg), "TERM:%s", nmeaBuff);
                 if(xQueueSend(termQueue, termMsg, 0) != pdTRUE) {
-                   Serial.println("[SİSTEM] Terminal Queue Doldu! Paket Düştü.");
+                   // Queue drop sessizce atlanır.
                 }
               }
             }
@@ -845,7 +941,15 @@ void loop() {
       safeGps.validLoc = gps.location.isValid(); safeGps.validAlt = gps.altitude.isValid();
       safeGps.validHdop = gps.hdop.isValid(); safeGps.validTime = gps.time.isValid();
       safeGps.hour = gps.time.hour(); safeGps.min = gps.time.minute(); safeGps.sec = gps.time.second();
+      safeGps.fixQual = globalFixQuality; 
       xSemaphoreGive(dataMutex);
     }
   }
+
+  uint32_t loopEnd = micros();
+  if (loopEnd >= loopStart) {
+      core1BusyTime += (loopEnd - loopStart);
+  }
+  
+  vTaskDelay(pdMS_TO_TICKS(1)); 
 }
