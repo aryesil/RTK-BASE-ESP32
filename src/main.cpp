@@ -291,7 +291,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         let versiyonKomutu = "$PQTMVERNO*58";
         websocket.send(versiyonKomutu); // ESP32'ye yolla, o da Serial2'ye bassın
         logTerminal("<span style='color:#fff; font-weight:bold;'>TX:</span> <span style='color:#00ffcc;'>" + versiyonKomutu + "</span>");
-    }, 1000);
+    }, 2000);
 };
             websocket.onclose = function(event) { logTerminal("<span style='color:#ffaa00;'>[SİSTEM] Bağlantı Koptu! Yeniden bağlanılıyor...</span>"); setTimeout(initWebSocket, 2000); };
             websocket.onmessage = onMessage;
@@ -671,10 +671,10 @@ void setup() {
   Serial2.println("$PAIR062,7,1*38"); delay(200); //NMEA GRS
   Serial2.println("$PAIR062,8,1*37"); delay(200); //NMEA GST
   Serial2.println("$PQTMCFGSVIN,W,1,300,2,0,0,0*20"); delay(200); //2 meter accuracy target min duration 3 minute
+  Serial2.println("$PAIR411,1*23"); delay(200); //SBAS Search Enable
   Serial2.println("$PAIR432,1*22"); delay(200); //RTCM MSM7
   Serial2.println("$PAIR434,1*22"); delay(200); //RTCM Message Type 1005
   Serial2.println("$PAIR436,1*26"); delay(200); //Ephemeris Data
-  Serial2.println("$PQTMVERNO*58"); delay(600); //Firmware version request
 
   xTaskCreatePinnedToCore(networkTaskCode, "NetworkTask", 16384, NULL, 1, &NetworkTaskHandle, 0);
 }
