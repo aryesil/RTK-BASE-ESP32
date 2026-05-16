@@ -30,9 +30,9 @@ WiFiClient tcpClients[3];
 
 // FreeRTOS Görev, Mutex ve Kuyruk Tanımlamaları
 TaskHandle_t NetworkTaskHandle;
-SemaphoreHandle_t dataMutex; // Uydu ve GPS verisini korur
-SemaphoreHandle_t tcpMutex;  // TCP Soketlerini korur
-QueueHandle_t termQueue;     // Terminal mesajlarını çekirdekler arası güvenle taşır
+SemaphoreHandle_t dataMutex; 
+SemaphoreHandle_t tcpMutex;  
+QueueHandle_t termQueue;     
 
 // --- ÇİFT BANT DESTEKLİ UYDU VERİ YAPISI ---
 struct SatData {
@@ -45,7 +45,8 @@ struct SatData {
   uint32_t lastSeen; 
 };
 
-#define MAX_SATS 120
+// JSON Truncation'ı engellemek için sınır 150'ye çıkarıldı
+#define MAX_SATS 150
 SatData activeSats[MAX_SATS];
 volatile int activeSatCount = 0;
 
@@ -59,7 +60,6 @@ struct GpsSnapshot {
 volatile uint32_t rtcmPaketSayaci = 0;
 volatile uint32_t sonPpsZamaniMicros = 0; 
 
-// HATA FIX: Modern NMEA mesajları için 256 byte Buffer
 #define MAX_NMEA 256
 char nmeaBuff[MAX_NMEA];
 int nmeaIdx = 0;
@@ -96,7 +96,6 @@ void addSat(const char* sys, int id, int elev, int azim, int snr, int sig) {
   }
 }
 
-// O(N) Karmaşıklığına İndirilmiş Yaşlandırma Algoritması
 void cleanOldSatellites() {
   if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
     uint32_t now = millis();
@@ -132,7 +131,7 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
 }
 
 // ==========================================
-// 4. GÖMÜLÜ WEB SAYFASI (DEĞİŞTİRİLMEDİ)
+// 4. GÖMÜLÜ WEB SAYFASI
 // ==========================================
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -219,6 +218,11 @@ const char index_html[] PROGMEM = R"rawliteral(
                     <div class="sat-box-title">NAVIC</div>
                     <div class="sat-sig-row"><span>L5:</span><span class="val" id="nav-l5">0</span></div>
                 </div>
+                <!-- SBAS KUTUSU -->
+                <div class="sat-box" style="border-color: #4169E1;">
+                    <div class="sat-box-title" style="color: #66aaff;">SBAS</div>
+                    <div class="sat-sig-row"><span>L1:</span><span class="val" id="sba-l1" style="color:#ffffff;">0</span></div>
+                </div>
             </div>
             <h3 style="margin-top: 15px;">🌌 SKYVIEW (Canlı Radar)</h3>
             <canvas id="skyview" width="500" height="500"></canvas>
@@ -235,7 +239,8 @@ const char index_html[] PROGMEM = R"rawliteral(
         var flagUrls = {
             "GP": "https://flagcdn.com/w40/us.png", "GL": "https://flagcdn.com/w40/ru.png", 
             "GA": "https://flagcdn.com/w40/eu.png", "GB": "https://flagcdn.com/w40/cn.png", 
-            "GI": "https://flagcdn.com/w40/in.png", "GQ": "https://flagcdn.com/w40/jp.png"  
+            "GI": "https://flagcdn.com/w40/in.png", "GQ": "https://flagcdn.com/w40/jp.png",
+            "SB": "https://flagcdn.com/w40/eu.png" // SBAS için Avrupa Birliği (EGNOS) Bayrağı
         };
         for(let key in flagUrls){ let img = new Image(); img.src = flagUrls[key]; flags[key] = img; }
 
@@ -259,7 +264,10 @@ const char index_html[] PROGMEM = R"rawliteral(
                 var y = cy + satR * Math.sin(rad);
 
                 var balonYaricap = 10; 
-                var glowColor = sat.sn > 35 ? "rgba(0, 255, 0, 0.7)" : sat.sn > 25 ? "rgba(255, 255, 0, 0.7)" : "rgba(255, 0, 0, 0.7)"; 
+                
+                var glowColor = sat.s === "SB" ? "rgba(65, 105, 225, 0.9)" : 
+                                sat.sn > 35 ? "rgba(0, 255, 0, 0.7)" : 
+                                sat.sn > 25 ? "rgba(255, 255, 0, 0.7)" : "rgba(255, 0, 0, 0.7)"; 
 
                 ctx.save(); ctx.shadowBlur = (sat.sn / 2) + 5; ctx.shadowColor = glowColor; ctx.fillStyle = glowColor;
                 ctx.beginPath(); ctx.arc(x, y, balonYaricap + 2, 0, 2*Math.PI); ctx.fill(); ctx.restore(); 
@@ -272,7 +280,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 
                 ctx.beginPath(); ctx.arc(x, y, balonYaricap, 0, 2*Math.PI); ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5; ctx.stroke();
 
-                var sysPrefix = sat.s === "GP" ? "G" : sat.s === "GL" ? "R" : sat.s === "GA" ? "E" : sat.s === "GB" ? "B" : sat.s === "GI" ? "I" : sat.s === "GQ" ? "Q" : "U";
+                var sysPrefix = sat.s === "GP" ? "G" : sat.s === "GL" ? "R" : sat.s === "GA" ? "E" : sat.s === "GB" ? "B" : sat.s === "GI" ? "I" : sat.s === "GQ" ? "Q" : sat.s === "SB" ? "S" : "U";
                 ctx.fillStyle = "#eee"; ctx.font = "bold 11px Arial"; ctx.textAlign = "left";
                 ctx.fillText(sysPrefix + sat.id, x + balonYaricap + 4, y + 4);
             });
@@ -284,15 +292,14 @@ const char index_html[] PROGMEM = R"rawliteral(
         function initWebSocket() {
             websocket = new WebSocket(gateway);
             websocket.onopen = function(event) { 
-    logTerminal("<span style='color:#33ff33;'>[SİSTEM] ESP32 Bağlantısı Kuruldu.</span>"); 
-    
-    // Bağlantı kurulduktan tam 1 saniye (1000 ms) sonra bu bloğu çalıştır
-    setTimeout(function() {
-        let versiyonKomutu = "$PQTMVERNO*58";
-        websocket.send(versiyonKomutu); // ESP32'ye yolla, o da Serial2'ye bassın
-        logTerminal("<span style='color:#fff; font-weight:bold;'>TX:</span> <span style='color:#00ffcc;'>" + versiyonKomutu + "</span>");
-    }, 2000);
-};
+                logTerminal("<span style='color:#33ff33;'>[SİSTEM] ESP32 Bağlantısı Kuruldu.</span>"); 
+                
+                setTimeout(function() {
+                    let versiyonKomutu = "$PQTMVERNO*58";
+                    websocket.send(versiyonKomutu); 
+                    logTerminal("<span style='color:#fff; font-weight:bold;'>TX:</span> <span style='color:#00ffcc;'>" + versiyonKomutu + "</span>");
+                }, 1000);
+            };
             websocket.onclose = function(event) { logTerminal("<span style='color:#ffaa00;'>[SİSTEM] Bağlantı Koptu! Yeniden bağlanılıyor...</span>"); setTimeout(initWebSocket, 2000); };
             websocket.onmessage = onMessage;
         }
@@ -360,7 +367,9 @@ const char index_html[] PROGMEM = R"rawliteral(
                 document.getElementById('qzs-l5').innerText = t.qzs.L5;
                 document.getElementById('nav-l5').innerText = t.nav.L5;
                 
-                document.getElementById('total_sats').innerText = t.gps.L1 + t.gps.L5 + t.glo.L1 + t.gal.E1 + t.gal.E5a + t.bei.B1 + t.bei.B2a + t.qzs.L1 + t.qzs.L5 + t.nav.L5;
+                document.getElementById('sba-l1').innerText = t.sba ? t.sba.L1 : 0;
+                
+                document.getElementById('total_sats').innerText = t.gps.L1 + t.gps.L5 + t.glo.L1 + t.gal.E1 + t.gal.E5a + t.bei.B1 + t.bei.B2a + t.qzs.L1 + t.qzs.L5 + t.nav.L5 + (t.sba ? t.sba.L1 : 0);
               
                 if(data.lat !== 0.0 && data.lon !== 0.0) {
                     var newLatLng = new L.LatLng(data.lat, data.lon); marker.setLatLng(newLatLng);
@@ -416,6 +425,7 @@ void uyduTipleriniAyristir(const char* nmea) {
     else if (strncmp(nmea, "$GB", 3) == 0 || strncmp(nmea, "$BD", 3) == 0) sys = "GB";
     else if (strncmp(nmea, "$GI", 3) == 0) sys = "GI";
     else if (strncmp(nmea, "$GQ", 3) == 0) sys = "GQ";
+    else if (strncmp(nmea, "$SB", 3) == 0) sys = "SB"; 
 
     int commas[25]; 
     int cCount = 0;
@@ -472,7 +482,30 @@ void uyduTipleriniAyristir(const char* nmea) {
         }
         
         if (id > 0) {
-          addSat(sys, id, elev, azim, snr, sig_id); 
+          // --- EGNOS / SBAS / QZSS İÇİN NOKTA ATIŞI FİLTRELEME VE 87 OFFSET GERİ YÜKLEME ---
+          const char* finalSys = sys;
+
+          if (strcmp(sys, "GP") == 0 || strcmp(sys, "UN") == 0 || strcmp(sys, "SB") == 0) {
+              
+              if (id == 121 || id == 123 || id == 126 || id == 136 || // EGNOS
+                  id == 131 || id == 133 || id == 135 ||              // WAAS
+                  id == 127 || id == 128 || id == 157 ||              // GAGAN
+                  id == 129 || id == 137 ||                           // MSAS
+                  id == 134 || id == 149 ||                           // KASS
+                  id == 130 || id == 143) {                           // BDSBAS
+                  finalSys = "SB"; 
+              } 
+              // --- EĞER MODÜL 87 ÇIKARARAK (33-64) GÖNDERDİYSE: ---
+              else if (id >= 33 && id <= 64) {                           
+                  finalSys = "SB"; 
+                  id += 87; // GERÇEK PRN NUMARASINI (120+) RESTORE ET!
+              } 
+              else if (id == 183 || id == 193 || (id >= 193 && id <= 200)) {
+                  finalSys = "GQ"; 
+              }
+          }
+          
+          addSat(finalSys, id, elev, azim, snr, sig_id); 
         }
       }
     }
@@ -487,12 +520,11 @@ void networkTaskCode(void * parameter) {
   static unsigned long sonWifiKontrol = 0;
 
   static SatData localSats[MAX_SATS];
-  static char jsonBuffer[3072];
+  static char jsonBuffer[6144]; 
 
   for(;;) {
     uint32_t now = millis();
 
-    // HATA FIX: WiFi.reconnect() Deprecation
     if (now - sonWifiKontrol >= 10000) {
       sonWifiKontrol = now;
       if (WiFi.status() != WL_CONNECTED) {
@@ -506,7 +538,6 @@ void networkTaskCode(void * parameter) {
       ws.cleanupClients();
     }
 
-    // HATA FIX: Queue Pointer (Array Decay - & İşareti Kaldırıldı)
     char queuedMsg[160];
     while (xQueueReceive(termQueue, queuedMsg, 0) == pdTRUE) {
       if (ws.count() > 0) {
@@ -514,13 +545,11 @@ void networkTaskCode(void * parameter) {
       }
     }
 
-    // 3. Telemetri Yayını (Saniyede 1)
     if (now - sonJsonZamani >= 1000) {
       sonJsonZamani = now;
       cleanOldSatellites(); 
 
       if (ws.count() > 0) {
-        // --- 1. ADIM: VERİLERİN YEREL KOPYASINI AL (SNAPSHOT) ---
         int localSatCount = 0;
         
         double locLat = 0.0, locLon = 0.0, locAlt = 0.0, locHdop = 0.0;
@@ -550,7 +579,6 @@ void networkTaskCode(void * parameter) {
           xSemaphoreGive(dataMutex);
         }
 
-        // HATA FIX: Thread-Safe ve Initialized TCP Client Kontrolü
         int activeTcp = 0;
         if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
           for (int i = 0; i < 3; i++) {
@@ -563,11 +591,10 @@ void networkTaskCode(void * parameter) {
           xSemaphoreGive(tcpMutex);
         }
 
-        // --- 3. ADIM: JSON OLUŞTUR (MUTEX DIŞINDA!) ---
         #if ARDUINOJSON_VERSION_MAJOR >= 7
           JsonDocument doc; 
         #else
-          DynamicJsonDocument doc(4096); 
+          DynamicJsonDocument doc(6144); 
         #endif
         
         doc["lat"] = locValidLoc ? locLat : 0.0;
@@ -579,7 +606,7 @@ void networkTaskCode(void * parameter) {
         doc["sat_time"] = locTime;
         doc["pps_active"] = (micros() - lastPps < 2000000) ? true : false; 
 
-        int gpsL1=0, gpsL5=0, gloL1=0, galE1=0, galE5a=0, beiB1=0, beiB2a=0, qzsL1=0, qzsL5=0, navL5=0;
+        int gpsL1=0, gpsL5=0, gloL1=0, galE1=0, galE5a=0, beiB1=0, beiB2a=0, qzsL1=0, qzsL5=0, navL5=0, sbaL1=0;
         JsonArray sky = doc["sky"].to<JsonArray>();
         
         for (int i = 0; i < localSatCount; i++) {
@@ -590,8 +617,9 @@ void networkTaskCode(void * parameter) {
           else if(strcmp(s.sys, "GB") == 0) { if(s.sig == 5 || s.sig == 6 || s.sig == 7 || s.sig == 0xB || s.sig == 0xC) beiB2a++; else beiB1++; }
           else if(strcmp(s.sys, "GQ") == 0) { if(s.sig == 8) qzsL5++; else qzsL1++; }
           else if(strcmp(s.sys, "GI") == 0) { navL5++; }
+          else if(strcmp(s.sys, "SB") == 0) { sbaL1++; } 
           
-          if(s.elev > 0 || s.azim > 0) {
+          if(s.elev > 0 || s.azim > 0 || s.snr > 0) {
             bool isPrimary = true;
             if((strcmp(s.sys, "GP") == 0 || strcmp(s.sys, "GQ") == 0) && s.sig == 8) isPrimary = false;
             if(strcmp(s.sys, "GA") == 0 && (s.sig == 1 || s.sig == 2 || s.sig == 3)) isPrimary = false;
@@ -611,6 +639,8 @@ void networkTaskCode(void * parameter) {
         JsonObject s_bei = sats["bei"].to<JsonObject>(); s_bei["B1"] = beiB1; s_bei["B2a"] = beiB2a;
         JsonObject s_qzs = sats["qzs"].to<JsonObject>(); s_qzs["L1"] = qzsL1; s_qzs["L5"] = qzsL5;
         JsonObject s_nav = sats["nav"].to<JsonObject>(); s_nav["L5"] = navL5;
+        
+        JsonObject s_sba = sats["sba"].to<JsonObject>(); s_sba["L1"] = sbaL1;
 
         serializeJson(doc, jsonBuffer);
         ws.textAll(jsonBuffer);
@@ -645,7 +675,6 @@ void setup() {
    request->send_P(200, "text/html", index_html);
   });
 
-  // HATA FIX: String kullanımı silindi, const char* ile Heap Fragmentation önlendi
   server.on("/cmd", HTTP_GET, [](AsyncWebServerRequest *request){
     if(request->hasParam("c")){
       const char* komut = request->getParam("c")->value().c_str();
@@ -662,19 +691,22 @@ void setup() {
   rtcmServer.begin();
   server.begin();
 
-  Serial2.println("$PAIR062,0,1*3F"); delay(200); //NMEA GGA (LAT, LON, ALT, STATUS))
-  Serial2.println("$PAIR062,1,1*3E"); delay(200); //NMEA GLL
-  Serial2.println("$PAIR062,2,1*3D"); delay(200); //NMEA GSA DOP
-  Serial2.println("$PAIR062,3,1*3C"); delay(200); //NMEA GSV (Skyview SNR)
-  Serial2.println("$PAIR062,4,1*3B"); delay(200); //NMEA RMC (Zaman, Tarih, Hız, Yön)
-  Serial2.println("$PAIR062,6,1*39"); delay(200); //NMEA ZDA (UTC Saat)
-  Serial2.println("$PAIR062,7,1*38"); delay(200); //NMEA GRS
-  Serial2.println("$PAIR062,8,1*37"); delay(200); //NMEA GST
-  Serial2.println("$PQTMCFGSVIN,W,1,300,2,0,0,0*20"); delay(200); //2 meter accuracy target min duration 3 minute
-  Serial2.println("$PAIR411,1*23"); delay(200); //SBAS Search Enable
-  Serial2.println("$PAIR432,1*22"); delay(200); //RTCM MSM7
-  Serial2.println("$PAIR434,1*22"); delay(200); //RTCM Message Type 1005
-  Serial2.println("$PAIR436,1*26"); delay(200); //Ephemeris Data
+  Serial2.println("$PAIR062,0,1*3F"); delay(100);
+  Serial2.println("$PAIR062,1,0*3E"); delay(100); 
+  Serial2.println("$PAIR062,2,0*3D"); delay(100); 
+  Serial2.println("$PAIR062,3,1*3C"); delay(100); 
+  Serial2.println("$PAIR062,4,0*3B"); delay(100); 
+  Serial2.println("$PAIR062,5,0*3A"); delay(100); 
+  Serial2.println("$PAIR062,6,1*39"); delay(100); 
+  Serial2.println("$PAIR062,7,1*38"); delay(100); 
+  Serial2.println("$PAIR062,8,1*37"); delay(100); 
+  Serial2.println("$PQTMCFGSVIN,W,1,300,2,0,0,0*20"); delay(100); 
+  Serial2.println("$PAIR411,1*23"); delay(100); 
+  Serial2.println("$PAIR432,1*22"); delay(100); 
+  Serial2.println("$PAIR434,1*24"); delay(100); 
+  Serial2.println("$PAIR436,1*26"); delay(100); 
+  
+  Serial2.println("$PQTMSAVEPAR*5A"); delay(200);
 
   xTaskCreatePinnedToCore(networkTaskCode, "NetworkTask", 16384, NULL, 1, &NetworkTaskHandle, 0);
 }
@@ -708,7 +740,6 @@ void loop() {
     if (bytesAvailable > sizeof(buf)) bytesAvailable = sizeof(buf);
     size_t len = Serial2.read(buf, bytesAvailable);
 
-    // HATA FIX: Partial Write Control (TCP koptuğunda soketi güvenle temizler)
     if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
       for (int i = 0; i < 3; i++) {
         if (tcpClients[i].connected()) {
@@ -768,11 +799,11 @@ void loop() {
           if (isChecksumValid(nmeaBuff)) {
             uyduTipleriniAyristir(nmeaBuff); 
             
-            // HATA FIX: Queue Pointer (Array Decay)
             if (strncmp(nmeaBuff, "$GN", 3) != 0 && strncmp(nmeaBuff, "$GP", 3) != 0 && 
                 strncmp(nmeaBuff, "$GL", 3) != 0 && strncmp(nmeaBuff, "$GA", 3) != 0 && 
                 strncmp(nmeaBuff, "$GB", 3) != 0 && strncmp(nmeaBuff, "$GQ", 3) != 0 && 
-                strncmp(nmeaBuff, "$GI", 3) != 0 && strncmp(nmeaBuff, "$BD", 3) != 0) {
+                strncmp(nmeaBuff, "$GI", 3) != 0 && strncmp(nmeaBuff, "$BD", 3) != 0 &&
+                strncmp(nmeaBuff, "$SB", 3) != 0) {
               
               char termMsg[160];
               snprintf(termMsg, sizeof(termMsg), "TERM:%s", nmeaBuff);
@@ -782,7 +813,6 @@ void loop() {
         }
         nmeaIdx = 0; 
       } else if (c >= 32 && c <= 126 && nmeaIdx > 0) {
-        // HATA FIX: NMEA Buffer Overflow Risk & Graceful Truncation
         if (nmeaIdx < MAX_NMEA - 1) {
             nmeaBuff[nmeaIdx++] = c;
         } else {
