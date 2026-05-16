@@ -283,7 +283,16 @@ const char index_html[] PROGMEM = R"rawliteral(
         var websocket;
         function initWebSocket() {
             websocket = new WebSocket(gateway);
-            websocket.onopen = function(event) { logTerminal("<span style='color:#33ff33;'>[SİSTEM] ESP32 Bağlantısı Kuruldu.</span>"); };
+            websocket.onopen = function(event) { 
+    logTerminal("<span style='color:#33ff33;'>[SİSTEM] ESP32 Bağlantısı Kuruldu.</span>"); 
+    
+    // Bağlantı kurulduktan tam 1 saniye (1000 ms) sonra bu bloğu çalıştır
+    setTimeout(function() {
+        let versiyonKomutu = "$PQTMVERNO*58";
+        websocket.send(versiyonKomutu); // ESP32'ye yolla, o da Serial2'ye bassın
+        logTerminal("<span style='color:#fff; font-weight:bold;'>TX:</span> <span style='color:#00ffcc;'>" + versiyonKomutu + "</span>");
+    }, 1000);
+};
             websocket.onclose = function(event) { logTerminal("<span style='color:#ffaa00;'>[SİSTEM] Bağlantı Koptu! Yeniden bağlanılıyor...</span>"); setTimeout(initWebSocket, 2000); };
             websocket.onmessage = onMessage;
         }
@@ -653,11 +662,19 @@ void setup() {
   rtcmServer.begin();
   server.begin();
 
-  Serial2.println("$PAIR062,0,1*3F"); delay(100);
-  Serial2.println("$PAIR062,3,1*3C"); delay(2000);
-  Serial2.println("$PQTMCFGSVIN,W,1,300,2,0,0,0*20"); delay(200);
-  Serial2.println("$PAIR432,1*22"); delay(200);
-  Serial2.println("$PAIR436,1*26");
+  Serial2.println("$PAIR062,0,1*3F"); delay(200); //NMEA GGA (LAT, LON, ALT, STATUS))
+  Serial2.println("$PAIR062,1,1*3E"); delay(200); //NMEA GLL
+  Serial2.println("$PAIR062,2,1*3D"); delay(200); //NMEA GSA DOP
+  Serial2.println("$PAIR062,3,1*3C"); delay(200); //NMEA GSV (Skyview SNR)
+  Serial2.println("$PAIR062,4,1*3B"); delay(200); //NMEA RMC (Zaman, Tarih, Hız, Yön)
+  Serial2.println("$PAIR062,6,1*39"); delay(200); //NMEA ZDA (UTC Saat)
+  Serial2.println("$PAIR062,7,1*38"); delay(200); //NMEA GRS
+  Serial2.println("$PAIR062,8,1*37"); delay(200); //NMEA GST
+  Serial2.println("$PQTMCFGSVIN,W,1,300,2,0,0,0*20"); delay(200); //2 meter accuracy target min duration 3 minute
+  Serial2.println("$PAIR432,1*22"); delay(200); //RTCM MSM7
+  Serial2.println("$PAIR434,1*22"); delay(200); //RTCM Message Type 1005
+  Serial2.println("$PAIR436,1*26"); delay(200); //Ephemeris Data
+  Serial2.println("$PQTMVERNO*58"); delay(600); //Firmware version request
 
   xTaskCreatePinnedToCore(networkTaskCode, "NetworkTask", 16384, NULL, 1, &NetworkTaskHandle, 0);
 }
