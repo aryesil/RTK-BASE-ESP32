@@ -34,6 +34,8 @@ SemaphoreHandle_t dataMutex;
 SemaphoreHandle_t tcpMutex;  
 QueueHandle_t termQueue;     
 
+portMUX_TYPE ppsMux = portMUX_INITIALIZER_UNLOCKED; 
+
 // --- ÇİFT BANT DESTEKLİ UYDU VERİ YAPISI ---
 struct SatData {
   int id;
@@ -45,12 +47,10 @@ struct SatData {
   uint32_t lastSeen; 
 };
 
-// JSON Truncation'ı engellemek için sınır 150'ye çıkarıldı
 #define MAX_SATS 150
 SatData activeSats[MAX_SATS];
 volatile int activeSatCount = 0;
 
-// Thread-Safe GPS Snapshot Yapısı
 struct GpsSnapshot {
   double lat, lon, alt, hdop;
   bool validLoc, validAlt, validHdop, validTime;
@@ -65,7 +65,9 @@ char nmeaBuff[MAX_NMEA];
 int nmeaIdx = 0;
 
 void IRAM_ATTR ppsKesmesi() {
+  portENTER_CRITICAL_ISR(&ppsMux);
   sonPpsZamaniMicros = micros(); 
+  portEXIT_CRITICAL_ISR(&ppsMux);
 }
 
 // Mutex Korumalı Uydu Ekleme
@@ -218,9 +220,8 @@ const char index_html[] PROGMEM = R"rawliteral(
                     <div class="sat-box-title">NAVIC</div>
                     <div class="sat-sig-row"><span>L5:</span><span class="val" id="nav-l5">0</span></div>
                 </div>
-                <!-- SBAS KUTUSU -->
                 <div class="sat-box" style="border-color: #4169E1;">
-                    <div class="sat-box-title" style="color: #66aaff;">SBAS</div>
+                    <div class="sat-box-title" style="color: #66aaff;">SBAS (EGNOS)</div>
                     <div class="sat-sig-row"><span>L1:</span><span class="val" id="sba-l1" style="color:#ffffff;">0</span></div>
                 </div>
             </div>
@@ -240,7 +241,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             "GP": "https://flagcdn.com/w40/us.png", "GL": "https://flagcdn.com/w40/ru.png", 
             "GA": "https://flagcdn.com/w40/eu.png", "GB": "https://flagcdn.com/w40/cn.png", 
             "GI": "https://flagcdn.com/w40/in.png", "GQ": "https://flagcdn.com/w40/jp.png",
-            "SB": "https://flagcdn.com/w40/eu.png" // SBAS için Avrupa Birliği (EGNOS) Bayrağı
+            "SB": "https://flagcdn.com/w40/eu.png" 
         };
         for(let key in flagUrls){ let img = new Image(); img.src = flagUrls[key]; flags[key] = img; }
 
@@ -327,6 +328,10 @@ const char index_html[] PROGMEM = R"rawliteral(
             var term = document.getElementById('terminal');
             var timeStr = new Date().toLocaleTimeString('tr-TR', { hour12: false });
             term.innerHTML += "<div class='term-line'><span style='color:#888; font-size:10px;'>[" + timeStr + "]</span> " + msg + "</div>";
+            
+            while(term.children.length > 100) {
+                term.removeChild(term.firstChild);
+            }
             term.scrollTop = term.scrollHeight; 
         }
 
@@ -482,23 +487,20 @@ void uyduTipleriniAyristir(const char* nmea) {
         }
         
         if (id > 0) {
-          // --- EGNOS / SBAS / QZSS İÇİN NOKTA ATIŞI FİLTRELEME VE 87 OFFSET GERİ YÜKLEME ---
           const char* finalSys = sys;
 
           if (strcmp(sys, "GP") == 0 || strcmp(sys, "UN") == 0 || strcmp(sys, "SB") == 0) {
-              
-              if (id == 121 || id == 123 || id == 126 || id == 136 || // EGNOS
-                  id == 131 || id == 133 || id == 135 ||              // WAAS
-                  id == 127 || id == 128 || id == 157 ||              // GAGAN
-                  id == 129 || id == 137 ||                           // MSAS
-                  id == 134 || id == 149 ||                           // KASS
-                  id == 130 || id == 143) {                           // BDSBAS
+              if (id == 121 || id == 123 || id == 126 || id == 136 || 
+                  id == 131 || id == 133 || id == 135 ||              
+                  id == 127 || id == 128 || id == 157 ||              
+                  id == 129 || id == 137 ||                           
+                  id == 134 || id == 149 ||                           
+                  id == 130 || id == 143) {                           
                   finalSys = "SB"; 
               } 
-              // --- EĞER MODÜL 87 ÇIKARARAK (33-64) GÖNDERDİYSE: ---
               else if (id >= 33 && id <= 64) {                           
                   finalSys = "SB"; 
-                  id += 87; // GERÇEK PRN NUMARASINI (120+) RESTORE ET!
+                  id += 87; 
               } 
               else if (id == 183 || id == 193 || (id >= 193 && id <= 200)) {
                   finalSys = "GQ"; 
@@ -520,7 +522,8 @@ void networkTaskCode(void * parameter) {
   static unsigned long sonWifiKontrol = 0;
 
   static SatData localSats[MAX_SATS];
-  static char jsonBuffer[6144]; 
+  
+  static char jsonBuffer[8192]; 
 
   for(;;) {
     uint32_t now = millis();
@@ -541,6 +544,7 @@ void networkTaskCode(void * parameter) {
     char queuedMsg[160];
     while (xQueueReceive(termQueue, queuedMsg, 0) == pdTRUE) {
       if (ws.count() > 0) {
+        // HATA FIX: Iterator Kütüphane Uyumluluğu ve Backpressure
         ws.textAll(queuedMsg);
       }
     }
@@ -573,11 +577,13 @@ void networkTaskCode(void * parameter) {
           
           currentRtcmCount = rtcmPaketSayaci;
           rtcmPaketSayaci = 0; 
-
-          lastPps = sonPpsZamaniMicros;
           
           xSemaphoreGive(dataMutex);
         }
+
+        portENTER_CRITICAL(&ppsMux);
+        lastPps = sonPpsZamaniMicros;
+        portEXIT_CRITICAL(&ppsMux);
 
         int activeTcp = 0;
         if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
@@ -592,9 +598,10 @@ void networkTaskCode(void * parameter) {
         }
 
         #if ARDUINOJSON_VERSION_MAJOR >= 7
-          JsonDocument doc; 
+          static JsonDocument doc; 
+          doc.clear(); 
         #else
-          DynamicJsonDocument doc(6144); 
+          StaticJsonDocument<8192> doc; 
         #endif
         
         doc["lat"] = locValidLoc ? locLat : 0.0;
@@ -643,10 +650,12 @@ void networkTaskCode(void * parameter) {
         JsonObject s_sba = sats["sba"].to<JsonObject>(); s_sba["L1"] = sbaL1;
 
         serializeJson(doc, jsonBuffer);
+        
+        // HATA FIX: Iterator Kütüphane Uyumluluğu. 
         ws.textAll(jsonBuffer);
       }
     }
-    vTaskDelay(pdMS_TO_TICKS(20));
+    vTaskDelay(pdMS_TO_TICKS(20)); 
   }
 }
 
@@ -671,14 +680,15 @@ void setup() {
   Serial.println("\nBAGLANDI! Tarayicinizdan su adrese gidin:");
   Serial.println(WiFi.localIP());
 
+  // HATA 1 FIX: send_P komutu ESPAsyncWebServer güncel sürümlerinde send olarak değiştirildi
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-   request->send_P(200, "text/html", index_html);
+   request->send(200, "text/html", index_html);
   });
 
   server.on("/cmd", HTTP_GET, [](AsyncWebServerRequest *request){
     if(request->hasParam("c")){
-      const char* komut = request->getParam("c")->value().c_str();
-      Serial2.print(komut); 
+      String cmdStr = request->getParam("c")->value();
+      Serial2.print(cmdStr); 
       Serial2.print("\r\n"); 
       request->send(200, "text/plain", "OK"); 
     } else {
@@ -742,7 +752,7 @@ void loop() {
 
     if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
       for (int i = 0; i < 3; i++) {
-        if (tcpClients[i].connected()) {
+        if (tcpClients[i].connected() && tcpClients[i].availableForWrite() >= len) {
           size_t written = tcpClients[i].write(buf, len);
           if (written < len) {
               tcpClients[i].stop();
@@ -756,6 +766,7 @@ void loop() {
     static uint16_t rtcmLen = 0;
     static uint16_t rtcmBytesRead = 0;
     static uint32_t lastRtcmTime = 0;
+    static uint16_t totalRtcmBytes = 0; 
 
     if (rtcmState != WAIT_SYNC && (millis() - lastRtcmTime > 50)) {
         rtcmState = WAIT_SYNC;
@@ -764,59 +775,66 @@ void loop() {
 
     for (size_t i = 0; i < len; i++) {
       uint8_t b = buf[i];
-      gps.encode(b); 
       
+      // Binary RTCM Verileri TinyGPS++ ve NMEA ayrıştırıcıdan YALITILDI!
       if (rtcmState == WAIT_SYNC && b == 0xD3) {
         rtcmState = WAIT_LEN1;
+        rtcmBytesRead = 1;
       } else if (rtcmState == WAIT_LEN1) {
         rtcmLen = (b & 0x03) << 8;
         rtcmState = WAIT_LEN2;
+        rtcmBytesRead++;
       } else if (rtcmState == WAIT_LEN2) {
         rtcmLen |= b;
-        rtcmBytesRead = 0;
+        totalRtcmBytes = rtcmLen + 6; 
         rtcmState = SKIP_PAYLOAD;
+        rtcmBytesRead++;
       } else if (rtcmState == SKIP_PAYLOAD) {
         rtcmBytesRead++;
-        if (rtcmBytesRead >= rtcmLen + 3) { 
+        if (rtcmBytesRead >= totalRtcmBytes) { 
           if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
             rtcmPaketSayaci++;
             xSemaphoreGive(dataMutex);
           }
           rtcmState = WAIT_SYNC;
         }
-      }
-      
-      char c = (char)b;
-      
-      if (c == '$') {
-        nmeaIdx = 0;
-        nmeaBuff[nmeaIdx++] = c;
-      } else if (c == '\n') {
-        if (nmeaIdx > 0 && nmeaBuff[0] == '$') {
-          if (nmeaBuff[nmeaIdx - 1] == '\r') nmeaBuff[nmeaIdx - 1] = '\0';
-          else nmeaBuff[nmeaIdx] = '\0'; 
-          
-          if (isChecksumValid(nmeaBuff)) {
-            uyduTipleriniAyristir(nmeaBuff); 
+      } else {
+        // --- BURASI SADECE ASCII NMEA VERİLERİ İÇİNDİR ---
+        gps.encode(b); 
+        char c = (char)b;
+        
+        if (c == '$') {
+          nmeaIdx = 0;
+          nmeaBuff[nmeaIdx++] = c;
+        } else if (c == '\n') {
+          if (nmeaIdx > 0 && nmeaBuff[0] == '$') {
+            if (nmeaBuff[nmeaIdx - 1] == '\r') nmeaBuff[nmeaIdx - 1] = '\0';
+            else nmeaBuff[nmeaIdx] = '\0'; 
             
-            if (strncmp(nmeaBuff, "$GN", 3) != 0 && strncmp(nmeaBuff, "$GP", 3) != 0 && 
-                strncmp(nmeaBuff, "$GL", 3) != 0 && strncmp(nmeaBuff, "$GA", 3) != 0 && 
-                strncmp(nmeaBuff, "$GB", 3) != 0 && strncmp(nmeaBuff, "$GQ", 3) != 0 && 
-                strncmp(nmeaBuff, "$GI", 3) != 0 && strncmp(nmeaBuff, "$BD", 3) != 0 &&
-                strncmp(nmeaBuff, "$SB", 3) != 0) {
+            if (isChecksumValid(nmeaBuff)) {
+              uyduTipleriniAyristir(nmeaBuff); 
               
-              char termMsg[160];
-              snprintf(termMsg, sizeof(termMsg), "TERM:%s", nmeaBuff);
-              xQueueSend(termQueue, termMsg, 0); 
+              if (strncmp(nmeaBuff, "$GN", 3) != 0 && strncmp(nmeaBuff, "$GP", 3) != 0 && 
+                  strncmp(nmeaBuff, "$GL", 3) != 0 && strncmp(nmeaBuff, "$GA", 3) != 0 && 
+                  strncmp(nmeaBuff, "$GB", 3) != 0 && strncmp(nmeaBuff, "$GQ", 3) != 0 && 
+                  strncmp(nmeaBuff, "$GI", 3) != 0 && strncmp(nmeaBuff, "$BD", 3) != 0 &&
+                  strncmp(nmeaBuff, "$SB", 3) != 0) {
+                
+                char termMsg[160];
+                snprintf(termMsg, sizeof(termMsg), "TERM:%s", nmeaBuff);
+                if(xQueueSend(termQueue, termMsg, 0) != pdTRUE) {
+                   Serial.println("[SİSTEM] Terminal Queue Doldu! Paket Düştü.");
+                }
+              }
             }
           }
-        }
-        nmeaIdx = 0; 
-      } else if (c >= 32 && c <= 126 && nmeaIdx > 0) {
-        if (nmeaIdx < MAX_NMEA - 1) {
-            nmeaBuff[nmeaIdx++] = c;
-        } else {
-            nmeaIdx = 0; 
+          nmeaIdx = 0; 
+        } else if (c >= 32 && c <= 126 && nmeaIdx > 0) {
+          if (nmeaIdx < MAX_NMEA - 1) {
+              nmeaBuff[nmeaIdx++] = c;
+          } else {
+              nmeaIdx = 0; 
+          }
         }
       }
     }
