@@ -563,7 +563,6 @@ void networkTaskCode(void * parameter) {
   static unsigned long sonWifiKontrol = 0;
   static SatData localSats[MAX_SATS];
   
-  // İŞTE EKSİK OLAN JSON BUFFER TANIMLAMASI BURADA!
   static char jsonBuffer[8192]; 
   
   static uint32_t core0BusyTimeAcc = 0; 
@@ -712,7 +711,7 @@ void networkTaskCode(void * parameter) {
           else if(strcmp(s.sys, "GI") == 0) { navL5++; }
           else if(strcmp(s.sys, "SB") == 0) { sbaL1++; } 
           
-          if(s.elev > 0 || s.azim > 0 || s.snr > 0) {
+          if(s.elev != 0 || s.azim != 0) {
             bool isPrimary = true;
             if((strcmp(s.sys, "GP") == 0 || strcmp(s.sys, "GQ") == 0) && s.sig == 8) isPrimary = false;
             if(strcmp(s.sys, "GA") == 0 && (s.sig == 1 || s.sig == 2 || s.sig == 3)) isPrimary = false;
@@ -735,7 +734,6 @@ void networkTaskCode(void * parameter) {
         
         JsonObject s_sba = sats["sba"].to<JsonObject>(); s_sba["L1"] = sbaL1;
 
-        // Statik buffer'a veriyi güvenle serileştiriyoruz.
         size_t jsonLen = serializeJson(doc, jsonBuffer);
         
         AsyncWebSocketMessageBuffer * wsBuf = ws.makeBuffer(jsonLen);
@@ -758,6 +756,57 @@ void networkTaskCode(void * parameter) {
 // ==========================================
 // 6. KURULUM (SETUP)
 // ==========================================
+
+bool sendGnssCommand(const char* cmd, unsigned long timeoutMs = 1000) {
+  while(Serial2.available()) Serial2.read(); 
+  
+  Serial2.print(cmd);
+  Serial2.print("\r\n");
+  Serial.print("[GNSS-TX] "); Serial.println(cmd);
+
+  char expectedAck[32] = {0};
+  
+  if (strncmp(cmd, "$PAIR", 5) == 0) {
+    char cmdId[4] = {0};
+    strncpy(cmdId, cmd + 5, 3);
+    snprintf(expectedAck, sizeof(expectedAck), "$PAIR001,%s,0", cmdId);
+  } 
+  else if (strncmp(cmd, "$PQTM", 5) == 0) {
+    int endIdx = 0;
+    while(cmd[endIdx] != ',' && cmd[endIdx] != '*' && cmd[endIdx] != '\0' && endIdx < 31) {
+      expectedAck[endIdx] = cmd[endIdx];
+      endIdx++;
+    }
+    expectedAck[endIdx] = '\0';
+    strcat(expectedAck, ",OK"); 
+  } 
+  else {
+    strcpy(expectedAck, "OK");
+  }
+
+  unsigned long start = millis();
+  String line = "";
+  
+  while (millis() - start < timeoutMs) {
+    if (Serial2.available()) {
+      char c = Serial2.read();
+      if (c == '\n') {
+        if (line.indexOf(expectedAck) != -1) {
+          Serial.print("[GNSS-RX] ONAY ALINDI: "); Serial.println(line);
+          return true;
+        }
+        line = ""; 
+      } else if (c != '\r') {
+        line += c;
+      }
+    }
+  }
+  
+  Serial.print("[GNSS-ERR] ZAMAN ASIMI! Modul su onayi vermedi: ");
+  Serial.println(expectedAck);
+  return false;
+}
+
 void setup() {
   Serial.begin(115200);
   
@@ -798,22 +847,30 @@ void setup() {
   rtcmServer.begin();
   server.begin();
 
-  Serial2.println("$PAIR062,0,1*3F"); delay(100);
-  Serial2.println("$PAIR062,1,0*3E"); delay(100); 
-  Serial2.println("$PAIR062,2,0*3D"); delay(100); 
-  Serial2.println("$PAIR062,3,1*3C"); delay(100); 
-  Serial2.println("$PAIR062,4,0*3B"); delay(100); 
-  Serial2.println("$PAIR062,5,0*3A"); delay(100); 
-  Serial2.println("$PAIR062,6,1*39"); delay(100); 
-  Serial2.println("$PAIR062,7,1*38"); delay(100); 
-  Serial2.println("$PAIR062,8,1*37"); delay(100); 
-  Serial2.println("$PQTMCFGSVIN,W,1,300,2,0,0,0*20"); delay(100); 
-  Serial2.println("$PAIR411,1*23"); delay(100); 
-  Serial2.println("$PAIR432,1*22"); delay(100); 
-  Serial2.println("$PAIR434,1*24"); delay(100); 
-  Serial2.println("$PAIR436,1*26"); delay(100); 
+  const char* initCommands[] = {
+    "$PAIR062,0,1*3F",
+    "$PAIR062,1,1*3E", 
+    "$PAIR062,2,1*3D", 
+    "$PAIR062,3,1*3C", 
+    "$PAIR062,4,1*3B",  
+    "$PAIR062,6,1*39", 
+    "$PAIR062,7,1*38", 
+    "$PAIR062,8,1*37", 
+    "$PQTMCFGSVIN,W,1,120,8,0,0,0*29", 
+    "$PAIR411,1*23", 
+    "$PAIR432,1*22", 
+    "$PAIR434,1*24", 
+    "$PAIR436,1*26", 
+    "$PQTMSAVEPAR*5A"
+  };
+
+  int numCmds = sizeof(initCommands) / sizeof(initCommands[0]);
   
-  Serial2.println("$PQTMSAVEPAR*5A"); delay(200);
+  Serial.println("\n=== GNSS YAPILANDIRMASI BASLIYOR ===");
+  for (int i = 0; i < numCmds; i++) {
+    sendGnssCommand(initCommands[i], 1000); 
+  }
+  Serial.println("=== GNSS YAPILANDIRMASI TAMAMLANDI ===\n");
 
   xTaskCreatePinnedToCore(networkTaskCode, "NetworkTask", 16384, NULL, 1, &NetworkTaskHandle, 0);
 }
@@ -852,6 +909,7 @@ void loop() {
     
     size_t len = Serial2.read(buf, bytesAvailable);
 
+    // MÜHENDİSLİK DÜZELTMESİ: RTCM akışındaki kesintileri tamamen bitiren limitsiz yazma bloğu
     if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
       for (int i = 0; i < 3; i++) {
         if (tcpClients[i].connected()) {
@@ -935,7 +993,7 @@ void loop() {
                 char termMsg[160];
                 snprintf(termMsg, sizeof(termMsg), "TERM:%s", nmeaBuff);
                 if(xQueueSend(termQueue, termMsg, 0) != pdTRUE) {
-                   // Kuyruk dolduğunda log düşme
+                   // Kuyruk dolduğunda sessiz düşüş
                 }
               }
             }
