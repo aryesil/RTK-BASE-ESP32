@@ -563,6 +563,9 @@ void networkTaskCode(void * parameter) {
   static unsigned long sonWifiKontrol = 0;
   static SatData localSats[MAX_SATS];
   
+  // İŞTE EKSİK OLAN JSON BUFFER TANIMLAMASI BURADA!
+  static char jsonBuffer[8192]; 
+  
   static uint32_t core0BusyTimeAcc = 0; 
   static uint32_t lastCpuCheckTime = millis(); 
 
@@ -732,14 +735,12 @@ void networkTaskCode(void * parameter) {
         
         JsonObject s_sba = sats["sba"].to<JsonObject>(); s_sba["L1"] = sbaL1;
 
-        // DÜZELTME: JSON boyutlandırma ve String çevrimi koptu. Dinamik bellek ile aktarım.
-        String tempJsonStr;
-        serializeJson(doc, tempJsonStr);
+        // Statik buffer'a veriyi güvenle serileştiriyoruz.
+        size_t jsonLen = serializeJson(doc, jsonBuffer);
         
-        size_t jsonLen = tempJsonStr.length();
         AsyncWebSocketMessageBuffer * wsBuf = ws.makeBuffer(jsonLen);
         if (wsBuf) {
-            memcpy(wsBuf->get(), tempJsonStr.c_str(), jsonLen);
+            memcpy(wsBuf->get(), jsonBuffer, jsonLen);
             ws.textAll(wsBuf); 
         }
       }
@@ -851,7 +852,6 @@ void loop() {
     
     size_t len = Serial2.read(buf, bytesAvailable);
 
-    // DÜZELTME: TCP Clientlara veriyi direkt ve koşulsuz yazıyoruz.
     if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
       for (int i = 0; i < 3; i++) {
         if (tcpClients[i].connected()) {
@@ -935,7 +935,7 @@ void loop() {
                 char termMsg[160];
                 snprintf(termMsg, sizeof(termMsg), "TERM:%s", nmeaBuff);
                 if(xQueueSend(termQueue, termMsg, 0) != pdTRUE) {
-                   //
+                   // Kuyruk dolduğunda log düşme
                 }
               }
             }
