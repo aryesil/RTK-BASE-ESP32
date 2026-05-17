@@ -49,7 +49,7 @@ struct SatData {
 
 #define MAX_SATS 150
 SatData activeSats[MAX_SATS];
-volatile int activeSatCount = 0;
+int activeSatCount = 0;
 
 struct GpsSnapshot {
   double lat, lon, alt, hdop;
@@ -58,12 +58,12 @@ struct GpsSnapshot {
   uint8_t fixQual; 
 } safeGps;
 
-volatile uint32_t rtcmPaketSayaci = 0;
+uint32_t rtcmPaketSayaci = 0;
 volatile uint32_t sonPpsZamaniMicros = 0; 
-volatile uint8_t globalFixQuality = 0; 
+uint8_t globalFixQuality = 0; 
 
 // Çekirdek İşlemci Yükü Takibi İçin Sayaçlar
-volatile uint32_t core1BusyTime = 0; 
+uint32_t core1BusyTime = 0; 
 
 #define MAX_NMEA 256
 char nmeaBuff[MAX_NMEA];
@@ -562,8 +562,9 @@ void networkTaskCode(void * parameter) {
   static unsigned long sonJsonZamani = 0;
   static unsigned long sonWifiKontrol = 0;
   static SatData localSats[MAX_SATS];
-  static char jsonBuffer[8192]; 
+  
   static uint32_t core0BusyTimeAcc = 0; 
+  static uint32_t lastCpuCheckTime = millis(); 
 
   for(;;) {
     uint32_t c0TaskStart = micros();
@@ -585,12 +586,18 @@ void networkTaskCode(void * parameter) {
     char queuedMsg[160];
     while (xQueueReceive(termQueue, queuedMsg, 0) == pdTRUE) {
       if (ws.count() > 0) {
-        ws.textAll(queuedMsg); 
+        size_t len = strlen(queuedMsg);
+        AsyncWebSocketMessageBuffer * buffer = ws.makeBuffer(len);
+        if (buffer) {
+            memcpy(buffer->get(), queuedMsg, len);
+            ws.textAll(buffer);
+        }
       }
     }
 
-    if (now - sonJsonZamani >= 1000) {
-      sonJsonZamani = now;
+    uint32_t timeDiffMillis = now - lastCpuCheckTime;
+    if (timeDiffMillis >= 1000) {
+      
       cleanOldSatellites(); 
 
       if (ws.count() > 0) {
@@ -627,15 +634,19 @@ void networkTaskCode(void * parameter) {
         lastPps = sonPpsZamaniMicros;
         portEXIT_CRITICAL(&ppsMux);
 
+        uint32_t timeDiffMicros = timeDiffMillis * 1000;
+
         uint32_t c1Busy = core1BusyTime;
         core1BusyTime = 0; 
-        int cpu1Usage = (c1Busy * 100) / 1000000;
+        int cpu1Usage = (c1Busy * 100) / timeDiffMicros;
         if(cpu1Usage > 100) cpu1Usage = 100;
 
         uint32_t c0Busy = core0BusyTimeAcc;
         core0BusyTimeAcc = 0; 
-        int cpu0Usage = (c0Busy * 100) / 1000000;
+        int cpu0Usage = (c0Busy * 100) / timeDiffMicros;
         if(cpu0Usage > 100) cpu0Usage = 100;
+        
+        lastCpuCheckTime = now; 
 
         int activeTcp = 0;
         if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
@@ -721,9 +732,16 @@ void networkTaskCode(void * parameter) {
         
         JsonObject s_sba = sats["sba"].to<JsonObject>(); s_sba["L1"] = sbaL1;
 
-        serializeJson(doc, jsonBuffer);
+        // DÜZELTME: JSON boyutlandırma ve String çevrimi koptu. Dinamik bellek ile aktarım.
+        String tempJsonStr;
+        serializeJson(doc, tempJsonStr);
         
-        ws.textAll(jsonBuffer);
+        size_t jsonLen = tempJsonStr.length();
+        AsyncWebSocketMessageBuffer * wsBuf = ws.makeBuffer(jsonLen);
+        if (wsBuf) {
+            memcpy(wsBuf->get(), tempJsonStr.c_str(), jsonLen);
+            ws.textAll(wsBuf); 
+        }
       }
     }
     
@@ -742,7 +760,6 @@ void networkTaskCode(void * parameter) {
 void setup() {
   Serial.begin(115200);
   
-  // YENİ: TCP Gecikmelerinde Veri Kaybını Önlemek İçin UART Donanım Hafızası Büyütüldü (2048 Byte)
   Serial2.setRxBufferSize(2048);
   Serial2.begin(GNSS_BAUD, SERIAL_8N1, RXD2, TXD2);
 
@@ -809,7 +826,6 @@ void loop() {
   if (rtcmServer.hasClient()) {
     WiFiClient newClient = rtcmServer.available();
     if (newClient) {
-      // YENİ: TCP Gecikmesini (Latency) Sıfırlamak İçin Nagle Algoritması Kapatıldı
       newClient.setNoDelay(true); 
       
       bool added = false;
@@ -835,7 +851,7 @@ void loop() {
     
     size_t len = Serial2.read(buf, bytesAvailable);
 
-    // YENİ DÜZEN: Agresif Koruma Kaldırıldı. TCP Yayını Hiçbir Filtreye Girmeden Çalışır!
+    // DÜZELTME: TCP Clientlara veriyi direkt ve koşulsuz yazıyoruz.
     if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
       for (int i = 0; i < 3; i++) {
         if (tcpClients[i].connected()) {
@@ -919,17 +935,15 @@ void loop() {
                 char termMsg[160];
                 snprintf(termMsg, sizeof(termMsg), "TERM:%s", nmeaBuff);
                 if(xQueueSend(termQueue, termMsg, 0) != pdTRUE) {
-                   // Queue drop sessizce atlanır.
+                   //
                 }
               }
             }
           }
           nmeaIdx = 0; 
-        } else if (c >= 32 && c <= 126 && nmeaIdx > 0) {
+        } else if (c >= 32 && c <= 126) {
           if (nmeaIdx < MAX_NMEA - 1) {
               nmeaBuff[nmeaIdx++] = c;
-          } else {
-              nmeaIdx = 0; 
           }
         }
       }
