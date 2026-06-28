@@ -8,7 +8,7 @@
 #include <ArduinoOTA.h>
 
 // ==========================================
-// 1. KULLANICI AYARLARI & AĞ DURUM YÖNETİMİ
+// 1. USER SETTINGS & NETWORK STATE MANAGEMENT
 // ==========================================
 enum NetState { NET_AP, NET_CONNECTING, NET_SHOW_IP, NET_STA, NET_RECONNECTING };
 NetState currentNetState = NET_AP;
@@ -19,7 +19,7 @@ Preferences prefs;
 bool newCredentialsReceived = false;
 
 // ==========================================
-// 2. DONANIM VE NESNE TANIMLAMALARI
+// 2. HARDWARE AND OBJECT DEFINITIONS
 // ==========================================
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
@@ -35,7 +35,7 @@ TinyGPSPlus gps;
 WiFiServer rtcmServer(RTCM_PORT);
 WiFiClient tcpClients[3]; 
 
-// FreeRTOS Görev, Mutex ve Kuyruk Tanımlamaları
+// FreeRTOS Task, Mutex and Queue Definitions
 TaskHandle_t NetworkTaskHandle;
 SemaphoreHandle_t dataMutex; 
 SemaphoreHandle_t tcpMutex;  
@@ -43,7 +43,7 @@ QueueHandle_t termQueue;
 
 portMUX_TYPE ppsMux = portMUX_INITIALIZER_UNLOCKED; 
 
-// --- ÇİFT BANT DESTEKLİ UYDU VERİ YAPISI ---
+// --- DUAL-BAND SUPPORTED SATELLITE DATA STRUCTURE ---
 struct SatData {
   int id;
   char sys[4]; 
@@ -69,7 +69,7 @@ uint32_t rtcmPaketSayaci = 0;
 volatile uint32_t sonPpsZamaniMicros = 0; 
 uint8_t globalFixQuality = 0; 
 
-// Çekirdek İşlemci Yükü Takibi İçin Sayaçlar
+// Counters for Core CPU Load Tracking
 uint32_t core1BusyTime = 0; 
 
 #define MAX_NMEA 256
@@ -82,7 +82,7 @@ void IRAM_ATTR ppsKesmesi() {
   portEXIT_CRITICAL_ISR(&ppsMux);
 }
 
-// Mutex Korumalı Uydu Ekleme
+// Mutex Protected Satellite Addition
 void addSat(const char* sys, int id, int elev, int azim, int snr, int sig) {
   if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
     uint32_t now = millis();
@@ -125,7 +125,7 @@ void cleanOldSatellites() {
 }
 
 // ==========================================
-// 3. AĞ VE TERMİNAL OLAYLARI
+// 3. NETWORK AND TERMINAL EVENTS
 // ==========================================
 void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
   if (type == WS_EVT_DATA) {
@@ -138,22 +138,22 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
       
       Serial2.print(cmd);
       Serial2.print("\r\n");
-      Serial.print("[WS] Modüle Giden Komut: ");
+      Serial.print("[WS] Command Sent to Module: ");
       Serial.println(cmd);
     }
   }
 }
 
 // ==========================================
-// 4. GÖMÜLÜ WEB SAYFALARI (RTK & WIFI)
+// 4. EMBEDDED WEB PAGES (RTK & WIFI)
 // ==========================================
 const char wifi_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
-<html lang="tr">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ESP32 RTK - WiFi Kurulum</title>
+    <title>ESP32 RTK - WiFi Setup</title>
     <style>
         body { background-color: #121212; color: #00ffcc; font-family: 'Courier New', Courier, monospace; text-align: center; margin: 0; padding: 20px; }
         .card { background: #1e1e1e; padding: 20px; border-radius: 8px; border: 1px solid #333; display: inline-block; text-align: left; max-width: 400px; width: 100%; box-sizing: border-box; }
@@ -169,37 +169,37 @@ const char wifi_html[] PROGMEM = R"rawliteral(
 </head>
 <body>
     <div class="card" id="mainCard">
-        <h2>📡 WiFi Kurulumu</h2>
-        <button class="scan-btn" onclick="scanNetworks()">Ağları Tara</button>
+        <h2>📡 WiFi Setup</h2>
+        <button class="scan-btn" onclick="scanNetworks()">Scan Networks</button>
         
-        <label for="networks">Bulunan Ağlar:</label>
+        <label for="networks">Found Networks:</label>
         <select id="networks" onchange="document.getElementById('ssid').value = this.value;">
-            <option value="">Önce tarama yapın...</option>
+            <option value="">Scan first...</option>
         </select>
         
-        <label for="ssid">SSID (Ağ Adı):</label>
-        <input type="text" id="ssid" placeholder="Ağ adını girin veya listeden seçin">
+        <label for="ssid">SSID (Network Name):</label>
+        <input type="text" id="ssid" placeholder="Enter network name or select from list">
         
-        <label for="pass">Şifre:</label>
-        <input type="password" id="pass" placeholder="Ağ şifresi">
+        <label for="pass">Password:</label>
+        <input type="password" id="pass" placeholder="Network password">
         
-        <button onclick="connectWiFi()">Ağa Bağlan</button>
+        <button onclick="connectWiFi()">Connect to Network</button>
         <div id="status"></div>
     </div>
 
     <script>
         function scanNetworks() {
-            document.getElementById('networks').innerHTML = '<option value="">Taranıyor... Lütfen bekleyin.</option>';
-            document.getElementById('status').innerText = "Çevredeki ağlar taranıyor...";
+            document.getElementById('networks').innerHTML = '<option value="">Scanning... Please wait.</option>';
+            document.getElementById('status').innerText = "Scanning for nearby networks...";
             fetch('/scan').then(response => response.json()).then(data => {
-                let options = '<option value="">Bir ağ seçin...</option>';
+                let options = '<option value="">Select a network...</option>';
                 data.forEach(network => {
                     options += `<option value="${network}">${network}</option>`;
                 });
                 document.getElementById('networks').innerHTML = options;
-                document.getElementById('status').innerText = "Tarama tamamlandı.";
+                document.getElementById('status').innerText = "Scan complete.";
             }).catch(() => {
-                document.getElementById('status').innerText = "Tarama hatası!";
+                document.getElementById('status').innerText = "Scan error!";
                 document.getElementById('status').style.color = "#ff3333";
             });
         }
@@ -207,15 +207,15 @@ const char wifi_html[] PROGMEM = R"rawliteral(
         function checkStatus() {
             fetch('/status').then(r => r.json()).then(data => {
                 if (data.state === 2) { 
-                    // NET_SHOW_IP Durumu: Bağlantı başarılı, IP'yi kendi yayınından göster
-                    document.body.innerHTML = "<div class='card' style='text-align:center;'><h2>✅ Başarıyla Bağlandı!</h2><p>ESP32 ağdan şu IP adresini aldı:</p><h1 style='color:#fff;'>" + data.ip + "</h1><p style='color:#aaa; font-size:13px;'>Lütfen tarayıcınızdan bu yeni IP adresine gidin. ESP32 kendi yayınını 1 dakika içinde kapatıp normal moda geçecektir.</p></div>";
+                    // NET_SHOW_IP State: Connection successful, show IP from its own broadcast
+                    document.body.innerHTML = "<div class='card' style='text-align:center;'><h2> Connected Successfully!</h2><p>ESP32 received the following IP address from the network:</p><h1 style='color:#fff;'>" + data.ip + "</h1><p style='color:#aaa; font-size:13px;'>Please go to this new IP address in your browser. The ESP32 will turn off its own access point in 1 minute and switch to normal mode.</p></div>";
                 } else if (data.state === 1) { 
-                    // NET_CONNECTING Durumu: Hala bağlanmaya çalışıyor
-                    document.getElementById('status').innerText = "Ağa bağlanılıyor, lütfen bekleyin...";
-                    setTimeout(checkStatus, 2000); // 2 saniye sonra tekrar sor
+                    // NET_CONNECTING State: Still trying to connect
+                    document.getElementById('status').innerText = "Connecting to network, please wait...";
+                    setTimeout(checkStatus, 2000); // Ask again after 2 seconds
                 } else if (data.state === 0) { 
-                    // NET_AP Durumu: Bağlantı koptu veya şifre yanlış
-                    document.getElementById('status').innerText = "Bağlantı başarısız! Lütfen şifreyi kontrol edin.";
+                    // NET_AP State: Connection lost or wrong password
+                    document.getElementById('status').innerText = "Connection failed! Please check the password.";
                     document.getElementById('status').style.color = "#ff3333";
                 }
             }).catch(() => {
@@ -227,18 +227,18 @@ const char wifi_html[] PROGMEM = R"rawliteral(
             let ssid = document.getElementById('ssid').value.trim();
             let pass = document.getElementById('pass').value.trim();
             if (!ssid) {
-                alert("Lütfen bir ağ adı (SSID) girin.");
+                alert("Please enter a network name (SSID).");
                 return;
             }
-            document.getElementById('status').innerText = "Bağlantı isteği gönderildi. Bekleniyor...";
+            document.getElementById('status').innerText = "Connection request sent. Waiting...";
             document.getElementById('status').style.color = "#33ff33";
             
             fetch(`/connect?ssid=${encodeURIComponent(ssid)}&pass=${encodeURIComponent(pass)}`)
             .then(() => {
-                // İstek başarıyla gitti, şimdi arka planda IP alana kadar cihazı sorgula
+                // Request went successfully, now poll the device in the background until it gets an IP
                 setTimeout(checkStatus, 2000);
             }).catch(() => {
-                document.getElementById('status').innerText = "Hata oluştu, cihaza ulaşılamadı!";
+                document.getElementById('status').innerText = "Error occurred, device unreachable!";
                 document.getElementById('status').style.color = "#ff3333";
             });
         }
@@ -249,7 +249,7 @@ const char wifi_html[] PROGMEM = R"rawliteral(
 
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
-<html lang="tr">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -281,31 +281,31 @@ const char index_html[] PROGMEM = R"rawliteral(
     <h2>📡 ESP32 - RTK BASE</h2>
     <div class="grid">
         <div class="card">
-            <h3>🌐 SİSTEM & KONUM DURUMU</h3>
-            <div>Enlem: <span id="lat" class="value">Bekleniyor...</span></div>
-            <div>Boylam: <span id="lon" class="value">Bekleniyor...</span></div>
-            <div>İrtifa: <span id="alt" class="value">0.0</span> m</div>
+            <h3>🌐 SYSTEM & LOCATION STATUS</h3>
+            <div>Latitude: <span id="lat" class="value">Waiting...</span></div>
+            <div>Longitude: <span id="lon" class="value">Waiting...</span></div>
+            <div>Altitude: <span id="alt" class="value">0.0</span> m</div>
             <div>HDOP: <span id="hdop" class="value">0.0</span></div>
             <hr style="border: 0; border-top: 1px solid #444; margin: 10px 0;">
             <div>Fix Mode: <span id="f_mode" class="value alert">NO FIX</span></div>
             <div>Fix Quality: <span id="f_qual" class="value alert" style="font-size: 16px;">INVALID</span></div>
             <hr style="border: 0; border-top: 1px solid #444; margin: 10px 0;">
-            <div>PPS Durumu: <span id="pps_status" class="value alert">KİLİT YOK</span></div>
-            <div>Uydu Saati (UTC): <span id="sat_time" class="value" style="color:#aaffaa">--:--:--</span></div>
-            <div>RTCM3 Akışı: <span id="rtcm" class="value">0</span> pkt/sn</div>
-            <div>TCP Yayın (Port 2101): <span id="tcp_clients" class="value" style="color:#00ffcc">0</span> İstemci</div>
+            <div>PPS Status: <span id="pps_status" class="value alert">NO LOCK</span></div>
+            <div>Satellite Time (UTC): <span id="sat_time" class="value" style="color:#aaffaa">--:--:--</span></div>
+            <div>RTCM3 Stream: <span id="rtcm" class="value">0</span> pkt/sec</div>
+            <div>TCP Broadcast (Port 2101): <span id="tcp_clients" class="value" style="color:#00ffcc">0</span> Clients</div>
             <div id="map"></div>
-            <h3 style="margin-top: 15px;">⌨️ SERİ PORT TERMİNALİ</h3>
+            <h3 style="margin-top: 15px;">⌨️ SERIAL PORT TERMINAL</h3>
             <div style="display: flex; gap: 5px;">
                 <input type="text" id="cmdInput" placeholder="$PQTMCFGSVIN..." style="flex: 1; padding: 5px; border-radius: 4px; border: 1px solid #444; background: #000; color: #00ffcc; font-family: monospace;">
-                <button onclick="sendCommand()" style="padding: 5px 15px; background: #00ffcc; color: #000; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">GÖNDER</button>
+                <button onclick="sendCommand()" style="padding: 5px 15px; background: #00ffcc; color: #000; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">SEND</button>
             </div>
             <div id="terminal"></div>
             <p style="font-size: 10px; color: #888; margin-top: 5px; margin-bottom: 0;">* Commands starting with ‘$’ are automatically appended with a checksum.</p>
         </div>
 
         <div class="card">
-            <h3>🛰️ AKTİF SİNYAL DAĞILIMI (Toplam: <span id="total_sats">0</span> Sinyal)</h3>
+            <h3>🛰️ ACTIVE SIGNAL DISTRIBUTION (Total: <span id="total_sats">0</span> Signals)</h3>
             <div class="sat-grid">
                 <div class="sat-box">
                     <div class="sat-box-title">GPS</div>
@@ -342,10 +342,10 @@ const char index_html[] PROGMEM = R"rawliteral(
             </div>
             
             <div style="text-align: right; font-size: 11px; color: #888; margin-top: 5px; padding-right: 5px;">
-                CPU Yükü -> C0(Ağ): <span id="cpu0_usage" style="color: #00ffcc; font-weight: bold;">0%</span> | C1(GNSS): <span id="cpu1_usage" style="color: #00ffcc; font-weight: bold;">0%</span>
+                CPU Load -> C0(Network): <span id="cpu0_usage" style="color: #00ffcc; font-weight: bold;">0%</span> | C1(GNSS): <span id="cpu1_usage" style="color: #00ffcc; font-weight: bold;">0%</span>
             </div>
 
-            <h3 style="margin-top: 15px;">🌌 SKYVIEW (Canlı Radar)</h3>
+            <h3 style="margin-top: 15px;">🌌 SKYVIEW (Live Radar)</h3>
             <canvas id="skyview" width="500" height="500"></canvas>
         </div>
     </div>
@@ -413,7 +413,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         function initWebSocket() {
             websocket = new WebSocket(gateway);
             websocket.onopen = function(event) { 
-                logTerminal("<span style='color:#33ff33;'>[SİSTEM] ESP32 Bağlantısı Kuruldu.</span>"); 
+                logTerminal("<span style='color:#33ff33;'>[SYSTEM] ESP32 Connection Established.</span>"); 
                 
                 setTimeout(function() {
                     let versiyonKomutu = "$PQTMVERNO*58";
@@ -421,7 +421,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                     logTerminal("<span style='color:#fff; font-weight:bold;'>TX:</span> <span style='color:#00ffcc;'>" + versiyonKomutu + "</span>");
                 }, 1000);
             };
-            websocket.onclose = function(event) { logTerminal("<span style='color:#ffaa00;'>[SİSTEM] Bağlantı Koptu! Yeniden bağlanılıyor...</span>"); setTimeout(initWebSocket, 2000); };
+            websocket.onclose = function(event) { logTerminal("<span style='color:#ffaa00;'>[SYSTEM] Connection Lost! Reconnecting...</span>"); setTimeout(initWebSocket, 2000); };
             websocket.onmessage = onMessage;
         }
 
@@ -438,7 +438,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                 }
                 fetch('/cmd?c=' + encodeURIComponent(finalCmd))
                 .then(response => { if(response.ok) logTerminal("<span style='color:#33ff33; font-weight:bold;'>TX:</span> <span style='color:#00ffcc;'>" + finalCmd + "</span>"); })
-                .catch(error => { logTerminal("<span style='color:#ff3333;'>HATA: Modüle ulaşılamadı!</span>"); });
+                .catch(error => { logTerminal("<span style='color:#ff3333;'>ERROR: Module unreachable!</span>"); });
                 cmdInput.value = ""; 
             }
         }
@@ -446,7 +446,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 
         function logTerminal(msg) {
             var term = document.getElementById('terminal');
-            var timeStr = new Date().toLocaleTimeString('tr-TR', { hour12: false });
+            var timeStr = new Date().toLocaleTimeString('en-US', { hour12: false });
             term.innerHTML += "<div class='term-line'><span style='color:#888; font-size:10px;'>[" + timeStr + "]</span> " + msg + "</div>";
             
             while(term.children.length > 100) {
@@ -503,9 +503,9 @@ const char index_html[] PROGMEM = R"rawliteral(
 
                 var ppsEl = document.getElementById('pps_status');
                 if(data.pps_active) {
-                    ppsEl.innerText = "AKTİF (KİLİTLİ)"; ppsEl.className = "value good";
+                    ppsEl.innerText = "ACTIVE (LOCKED)"; ppsEl.className = "value good";
                 } else {
-                    ppsEl.innerText = "BEKLENİYOR..."; ppsEl.className = "value alert";
+                    ppsEl.innerText = "WAITING..."; ppsEl.className = "value alert";
                 }
 
                 let t = data.sats;
@@ -538,7 +538,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 )rawliteral";
 
 // ==========================================
-// 5. GÜVENLİ NMEA AYRIŞTIRICI
+// 5. SECURE NMEA PARSER
 // ==========================================
 bool isChecksumValid(const char* sentence) {
   int len = strlen(sentence);
@@ -663,7 +663,7 @@ void uyduTipleriniAyristir(const char* nmea) {
 }
 
 // ==========================================
-// CORE 0: AĞ, TELEMETRİ VE WATCHDOG GÖREVİ
+// CORE 0: NETWORK, TELEMETRY AND WATCHDOG TASK
 // ==========================================
 void networkTaskCode(void * parameter) {
   static unsigned long sonJsonZamani = 0;
@@ -679,7 +679,7 @@ void networkTaskCode(void * parameter) {
     uint32_t now = millis();
 
     // ---------------------------------------------------------
-    // WİFİ MANAGER VE WATCHDOG DURUM MAKİNESİ (SADECE CORE 0)
+    // WIFI MANAGER AND WATCHDOG STATE MACHINE (ONLY CORE 0)
     // ---------------------------------------------------------
     if (currentNetState == NET_AP) {
         ArduinoOTA.handle();
@@ -689,19 +689,19 @@ void networkTaskCode(void * parameter) {
             WiFi.begin(targetSSID.c_str(), targetPass.c_str());
             currentNetState = NET_CONNECTING;
             netStateTimer = millis();
-            Serial.println("[WIFI] Yeni aga baglanilmaya calisiliyor: " + targetSSID);
+            Serial.println("[WIFI] Trying to connect to new network: " + targetSSID);
         }
     }
     else if (currentNetState == NET_CONNECTING) {
         ArduinoOTA.handle();
         if (WiFi.status() == WL_CONNECTED) {
-            Serial.println("[WIFI] Baglandi! STA IP: " + WiFi.localIP().toString());
+            Serial.println("[WIFI] Connected! STA IP: " + WiFi.localIP().toString());
             prefs.putString("ssid", targetSSID);
             prefs.putString("pass", targetPass);
             currentNetState = NET_SHOW_IP;
             netStateTimer = millis();
-        } else if (now - netStateTimer > 30000) { // 30 saniye zaman aşımı
-            Serial.println("[WIFI] Baglanti basarisiz. AP Moduna geri donuluyor.");
+        } else if (now - netStateTimer > 30000) { // 30 seconds timeout
+            Serial.println("[WIFI] Connection failed. Returning to AP Mode.");
             WiFi.disconnect();
             WiFi.mode(WIFI_AP);
             WiFi.softAP("ESP32_RTK_BASE");
@@ -710,15 +710,15 @@ void networkTaskCode(void * parameter) {
     }
     else if (currentNetState == NET_SHOW_IP) {
         ArduinoOTA.handle(); 
-        if (now - netStateTimer > 60000) { // 1 Dakika (60 sn) gösterim süresi
-            Serial.println("[WIFI] 1 dakika gosterim bitti. AP kapatiliyor, sadece STA modunda devam edilecek.");
+        if (now - netStateTimer > 60000) { // 1 Minute (60 sec) display time
+            Serial.println("[WIFI] 1 minute display over. AP closing, continuing in STA mode only.");
             WiFi.mode(WIFI_STA); 
             currentNetState = NET_STA;
         }
     }
     else if (currentNetState == NET_STA) {
         if (WiFi.status() != WL_CONNECTED) {
-            Serial.println("[WIFI] Baglanti koptu! Yeniden baglanma deneniyor (Watchdog Aktif)...");
+            Serial.println("[WIFI] Connection lost! Attempting to reconnect (Watchdog Active)...");
             WiFi.disconnect();
             WiFi.reconnect();
             currentNetState = NET_RECONNECTING;
@@ -727,10 +727,10 @@ void networkTaskCode(void * parameter) {
     }
     else if (currentNetState == NET_RECONNECTING) {
         if (WiFi.status() == WL_CONNECTED) {
-            Serial.println("[WIFI] Yeniden baglandi!");
+            Serial.println("[WIFI] Reconnected!");
             currentNetState = NET_STA;
-        } else if (now - netStateTimer > 60000) { // 1 Dakika bağlanma denemesi zaman aşımı
-            Serial.println("[WIFI] 1 dakika icinde aga baglanamadi. Kurtarma icin AP aciliyor.");
+        } else if (now - netStateTimer > 60000) { // 1 Minute connection attempt timeout
+            Serial.println("[WIFI] Could not connect to network in 1 minute. Opening AP for recovery.");
             WiFi.mode(WIFI_AP_STA);
             WiFi.softAP("ESP32_RTK_BASE");
             currentNetState = NET_AP;
@@ -911,7 +911,7 @@ void networkTaskCode(void * parameter) {
 }
 
 // ==========================================
-// 6. KURULUM (SETUP)
+// 6. SETUP
 // ==========================================
 
 bool sendGnssCommand(const char* cmd, unsigned long timeoutMs = 1000) {
@@ -949,7 +949,7 @@ bool sendGnssCommand(const char* cmd, unsigned long timeoutMs = 1000) {
       char c = Serial2.read();
       if (c == '\n') {
         if (line.indexOf(expectedAck) != -1) {
-          Serial.print("[GNSS-RX] ONAY ALINDI: "); Serial.println(line);
+          Serial.print("[GNSS-RX] ACKNOWLEDGED: "); Serial.println(line);
           return true;
         }
         line = ""; 
@@ -959,7 +959,7 @@ bool sendGnssCommand(const char* cmd, unsigned long timeoutMs = 1000) {
     }
   }
   
-  Serial.print("[GNSS-ERR] ZAMAN ASIMI! Modul su onayi vermedi: ");
+  Serial.print("[GNSS-ERR] TIMEOUT! Module did not acknowledge: ");
   Serial.println(expectedAck);
   return false;
 }
@@ -977,9 +977,9 @@ void setup() {
   pinMode(PPS_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(PPS_PIN), ppsKesmesi, RISING);
 
-  Serial.println("\n=== SİSTEM BAŞLATILIYOR ===");
+  Serial.println("\n=== SYSTEM STARTING ===");
   
-  // WİFİ MANAGER VE HAFIZA YÜKLEMESİ
+  // WIFI MANAGER AND MEMORY LOAD
   prefs.begin("wifi_creds", false);
   targetSSID = prefs.getString("ssid", "");
   targetPass = prefs.getString("pass", "");
@@ -990,37 +990,37 @@ void setup() {
       WiFi.softAP("ESP32_RTK_BASE"); 
       WiFi.begin(targetSSID.c_str(), targetPass.c_str());
       netStateTimer = millis();
-      Serial.println("Kayitli aga baglaniliyor: " + targetSSID);
+      Serial.println("Connecting to saved network: " + targetSSID);
   } else {
       currentNetState = NET_AP;
       WiFi.mode(WIFI_AP);
       WiFi.softAP("ESP32_RTK_BASE");
-      Serial.println("Kayitli ag yok. AP Modu baslatildi: ESP32_RTK_BASE");
+      Serial.println("No saved network. AP Mode started: ESP32_RTK_BASE");
   }
 
-  // OTA YAPILANDIRMASI
+  // OTA CONFIGURATION
   ArduinoOTA.setHostname("ESP32-RTK-BASE");
   ArduinoOTA.begin();
 
-  Serial.print("WiFi Ayar Sayfasi IP Adresi (AP Modu): ");
+  Serial.print("WiFi Settings Page IP Address (AP Mode): ");
   Serial.println(WiFi.softAPIP());
 
-  // HTTP İSTEK YÖNETİMİ
+  // HTTP REQUEST MANAGEMENT
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
       if (currentNetState == NET_STA) {
           request->send(200, "text/html", index_html);
       } else if (currentNetState == NET_SHOW_IP) {
-          // Kullanıcı IP gösterimdeyken elle sayfayı yenilerse bu çıkacak
+          // If the user manually refreshes the page while showing IP, this will appear
           String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'></head><body style='background:#121212;color:#00ffcc;font-family:sans-serif;text-align:center;margin-top:50px;'>";
-          html += "<h2>✅ Basariyla Baglandi!</h2>";
-          html += "<p>ESP32 agdan su IP adresini aldi:</p>";
+          html += "<h2>✅ Connected Successfully!</h2>";
+          html += "<p>ESP32 received the following IP address from the network:</p>";
           html += "<h1 style='color:#fff;'>" + WiFi.localIP().toString() + "</h1>";
-          html += "<p style='color:#aaa;'>Lütfen tarayicinizdan bu yeni IP adresine gidin. ESP32 kendi AP yayinini 1 dakika icinde kapatacaktir.</p>";
+          html += "<p style='color:#aaa;'>Please go to this new IP address in your browser. The ESP32 will turn off its own AP broadcast in 1 minute.</p>";
           html += "</body></html>";
           request->send(200, "text/html", html);
       } else if (currentNetState == NET_CONNECTING) {
-          // Kullanıcı bağlanırken elle sayfayı yenilerse bu çıkacak (kendini 3 saniyede bir otomatik yeniler)
-          String html = "<html><head><meta http-equiv='refresh' content='3'><meta name='viewport' content='width=device-width, initial-scale=1.0'></head><body style='background:#121212;color:#ffdd00;text-align:center;font-family:sans-serif;margin-top:50px;'><h2>Ağa Bağlanılıyor...</h2><p>Lütfen bekleyin...</p></body></html>";
+          // If the user manually refreshes while connecting, this will appear (auto-refreshes every 3 seconds)
+          String html = "<html><head><meta http-equiv='refresh' content='3'><meta name='viewport' content='width=device-width, initial-scale=1.0'></head><body style='background:#121212;color:#ffdd00;text-align:center;font-family:sans-serif;margin-top:50px;'><h2>Connecting to Network...</h2><p>Please wait...</p></body></html>";
           request->send(200, "text/html", html);
       } else {
           request->send(200, "text/html", wifi_html);
@@ -1028,7 +1028,7 @@ void setup() {
   });
 
   server.on("/scan", HTTP_GET, [](AsyncWebServerRequest *request){
-      int n = WiFi.scanNetworks(false, true); // Asenkron tarama
+      int n = WiFi.scanNetworks(false, true); // Asynchronous scan
       String json = "[";
       for (int i = 0; i < n; ++i) {
           if (i > 0) json += ",";
@@ -1045,11 +1045,11 @@ void setup() {
           newCredentialsReceived = true;
           request->send(200, "text/plain", "OK");
       } else {
-          request->send(400, "text/plain", "Eksik parametre gönderildi.");
+          request->send(400, "text/plain", "Missing parameter sent.");
       }
   });
 
-  // Arka planda cihazın durumunu soran JSON uç noktası
+  // JSON endpoint polling the device status in the background
   server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request){
       String json = "{\"state\":" + String(currentNetState) + ",\"ip\":\"" + WiFi.localIP().toString() + "\"}";
       request->send(200, "application/json", json);
@@ -1062,7 +1062,7 @@ void setup() {
       Serial2.print("\r\n"); 
       request->send(200, "text/plain", "OK"); 
     } else {
-      request->send(400, "text/plain", "BOS");
+      request->send(400, "text/plain", "EMPTY");
     }
   });
 
@@ -1090,17 +1090,17 @@ void setup() {
 
   int numCmds = sizeof(initCommands) / sizeof(initCommands[0]);
   
-  Serial.println("\n=== GNSS YAPILANDIRMASI BASLIYOR ===");
+  Serial.println("\n=== GNSS CONFIGURATION STARTING ===");
   for (int i = 0; i < numCmds; i++) {
     sendGnssCommand(initCommands[i], 1000); 
   }
-  Serial.println("=== GNSS YAPILANDIRMASI TAMAMLANDI ===\n");
+  Serial.println("=== GNSS CONFIGURATION COMPLETED ===\n");
 
   xTaskCreatePinnedToCore(networkTaskCode, "NetworkTask", 16384, NULL, 1, &NetworkTaskHandle, 0);
 }
 
 // ==========================================
-// 7. CORE 1: YÜKSEK HIZLI GNSS VERİ İŞLEME
+// 7. CORE 1: HIGH-SPEED GNSS DATA PROCESSING
 // ==========================================
 void loop() {
   uint32_t loopStart = micros();
@@ -1133,7 +1133,7 @@ void loop() {
     
     size_t len = Serial2.read(buf, bytesAvailable);
 
-    // MÜHENDİSLİK DÜZELTMESİ: RTCM akışındaki kesintileri tamamen bitiren limitsiz yazma bloğu
+    // ENGINEERING FIX: Unlimited write block completely terminating interruptions in the RTCM stream
     if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
       for (int i = 0; i < 3; i++) {
         if (tcpClients[i].connected()) {
@@ -1217,7 +1217,7 @@ void loop() {
                 char termMsg[160];
                 snprintf(termMsg, sizeof(termMsg), "TERM:%s", nmeaBuff);
                 if(xQueueSend(termQueue, termMsg, 0) != pdTRUE) {
-                   // Kuyruk dolduğunda sessiz düşüş
+                   // Silent drop when queue is full
                 }
               }
             }
