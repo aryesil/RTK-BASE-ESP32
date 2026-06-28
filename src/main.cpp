@@ -4,12 +4,19 @@
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include <TinyGPS++.h>
+#include <Preferences.h>
+#include <ArduinoOTA.h>
 
 // ==========================================
-// 1. KULLANICI AYARLARI 
+// 1. KULLANICI AYARLARI & AĞ DURUM YÖNETİMİ
 // ==========================================
-const char* ssid = "Arda";
-const char* password = "ozurlubaskan";
+enum NetState { NET_AP, NET_CONNECTING, NET_SHOW_IP, NET_STA, NET_RECONNECTING };
+NetState currentNetState = NET_AP;
+uint32_t netStateTimer = 0;
+String targetSSID = "";
+String targetPass = "";
+Preferences prefs;
+bool newCredentialsReceived = false;
 
 // ==========================================
 // 2. DONANIM VE NESNE TANIMLAMALARI
@@ -138,8 +145,108 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
 }
 
 // ==========================================
-// 4. GÖMÜLÜ WEB SAYFASI
+// 4. GÖMÜLÜ WEB SAYFALARI (RTK & WIFI)
 // ==========================================
+const char wifi_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 RTK - WiFi Kurulum</title>
+    <style>
+        body { background-color: #121212; color: #00ffcc; font-family: 'Courier New', Courier, monospace; text-align: center; margin: 0; padding: 20px; }
+        .card { background: #1e1e1e; padding: 20px; border-radius: 8px; border: 1px solid #333; display: inline-block; text-align: left; max-width: 400px; width: 100%; box-sizing: border-box; }
+        h2 { color: #fff; text-align: center; border-bottom: 1px solid #444; padding-bottom: 10px; margin-top: 0; }
+        label { color: #aaa; font-size: 12px; display: block; margin-top: 10px; }
+        select, input { width: 100%; padding: 10px; margin: 5px 0 15px 0; background: #000; color: #00ffcc; border: 1px solid #444; border-radius: 4px; box-sizing: border-box; font-family: monospace; }
+        button { width: 100%; padding: 12px; background: #00ffcc; color: #000; border: none; border-radius: 4px; font-weight: bold; cursor: pointer; margin-bottom: 10px; }
+        button:hover { background: #00ccaa; }
+        .scan-btn { background: #444; color: #fff; }
+        .scan-btn:hover { background: #555; }
+        #status { text-align: center; color: #ffdd00; font-weight: bold; margin-top: 15px; font-size: 14px;}
+    </style>
+</head>
+<body>
+    <div class="card" id="mainCard">
+        <h2>📡 WiFi Kurulumu</h2>
+        <button class="scan-btn" onclick="scanNetworks()">Ağları Tara</button>
+        
+        <label for="networks">Bulunan Ağlar:</label>
+        <select id="networks" onchange="document.getElementById('ssid').value = this.value;">
+            <option value="">Önce tarama yapın...</option>
+        </select>
+        
+        <label for="ssid">SSID (Ağ Adı):</label>
+        <input type="text" id="ssid" placeholder="Ağ adını girin veya listeden seçin">
+        
+        <label for="pass">Şifre:</label>
+        <input type="password" id="pass" placeholder="Ağ şifresi">
+        
+        <button onclick="connectWiFi()">Ağa Bağlan</button>
+        <div id="status"></div>
+    </div>
+
+    <script>
+        function scanNetworks() {
+            document.getElementById('networks').innerHTML = '<option value="">Taranıyor... Lütfen bekleyin.</option>';
+            document.getElementById('status').innerText = "Çevredeki ağlar taranıyor...";
+            fetch('/scan').then(response => response.json()).then(data => {
+                let options = '<option value="">Bir ağ seçin...</option>';
+                data.forEach(network => {
+                    options += `<option value="${network}">${network}</option>`;
+                });
+                document.getElementById('networks').innerHTML = options;
+                document.getElementById('status').innerText = "Tarama tamamlandı.";
+            }).catch(() => {
+                document.getElementById('status').innerText = "Tarama hatası!";
+                document.getElementById('status').style.color = "#ff3333";
+            });
+        }
+
+        function checkStatus() {
+            fetch('/status').then(r => r.json()).then(data => {
+                if (data.state === 2) { 
+                    // NET_SHOW_IP Durumu: Bağlantı başarılı, IP'yi kendi yayınından göster
+                    document.body.innerHTML = "<div class='card' style='text-align:center;'><h2>✅ Başarıyla Bağlandı!</h2><p>ESP32 ağdan şu IP adresini aldı:</p><h1 style='color:#fff;'>" + data.ip + "</h1><p style='color:#aaa; font-size:13px;'>Lütfen tarayıcınızdan bu yeni IP adresine gidin. ESP32 kendi yayınını 1 dakika içinde kapatıp normal moda geçecektir.</p></div>";
+                } else if (data.state === 1) { 
+                    // NET_CONNECTING Durumu: Hala bağlanmaya çalışıyor
+                    document.getElementById('status').innerText = "Ağa bağlanılıyor, lütfen bekleyin...";
+                    setTimeout(checkStatus, 2000); // 2 saniye sonra tekrar sor
+                } else if (data.state === 0) { 
+                    // NET_AP Durumu: Bağlantı koptu veya şifre yanlış
+                    document.getElementById('status').innerText = "Bağlantı başarısız! Lütfen şifreyi kontrol edin.";
+                    document.getElementById('status').style.color = "#ff3333";
+                }
+            }).catch(() => {
+                 setTimeout(checkStatus, 2000);
+            });
+        }
+
+        function connectWiFi() {
+            let ssid = document.getElementById('ssid').value.trim();
+            let pass = document.getElementById('pass').value.trim();
+            if (!ssid) {
+                alert("Lütfen bir ağ adı (SSID) girin.");
+                return;
+            }
+            document.getElementById('status').innerText = "Bağlantı isteği gönderildi. Bekleniyor...";
+            document.getElementById('status').style.color = "#33ff33";
+            
+            fetch(`/connect?ssid=${encodeURIComponent(ssid)}&pass=${encodeURIComponent(pass)}`)
+            .then(() => {
+                // İstek başarıyla gitti, şimdi arka planda IP alana kadar cihazı sorgula
+                setTimeout(checkStatus, 2000);
+            }).catch(() => {
+                document.getElementById('status').innerText = "Hata oluştu, cihaza ulaşılamadı!";
+                document.getElementById('status').style.color = "#ff3333";
+            });
+        }
+    </script>
+</body>
+</html>
+)rawliteral";
+
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="tr">
@@ -194,7 +301,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <button onclick="sendCommand()" style="padding: 5px 15px; background: #00ffcc; color: #000; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">GÖNDER</button>
             </div>
             <div id="terminal"></div>
-            <p style="font-size: 10px; color: #888; margin-top: 5px; margin-bottom: 0;">* '$' ile başlayan komutlara otomatik Checksum eklenir.</p>
+            <p style="font-size: 10px; color: #888; margin-top: 5px; margin-bottom: 0;">* Commands starting with ‘$’ are automatically appended with a checksum.</p>
         </div>
 
         <div class="card">
@@ -539,7 +646,7 @@ void uyduTipleriniAyristir(const char* nmea) {
                   id == 130 || id == 143) {                           
                   finalSys = "SB"; 
               } 
-              else if (id >= 33 && id <= 64) {                           
+              else if (id >= 33 && id <= 64) {                          
                   finalSys = "SB"; 
                   id += 87; 
               } 
@@ -560,7 +667,6 @@ void uyduTipleriniAyristir(const char* nmea) {
 // ==========================================
 void networkTaskCode(void * parameter) {
   static unsigned long sonJsonZamani = 0;
-  static unsigned long sonWifiKontrol = 0;
   static SatData localSats[MAX_SATS];
   
   static char jsonBuffer[8192]; 
@@ -572,14 +678,65 @@ void networkTaskCode(void * parameter) {
     uint32_t c0TaskStart = micros();
     uint32_t now = millis();
 
-    if (now - sonWifiKontrol >= 10000) {
-      sonWifiKontrol = now;
-      if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[WIFI] Baglanti Koptu! Yeniden baglaniliyor...");
-        WiFi.disconnect();
-        WiFi.begin(ssid, password);
-      }
+    // ---------------------------------------------------------
+    // WİFİ MANAGER VE WATCHDOG DURUM MAKİNESİ (SADECE CORE 0)
+    // ---------------------------------------------------------
+    if (currentNetState == NET_AP) {
+        ArduinoOTA.handle();
+        if (newCredentialsReceived) {
+            newCredentialsReceived = false;
+            WiFi.mode(WIFI_AP_STA);
+            WiFi.begin(targetSSID.c_str(), targetPass.c_str());
+            currentNetState = NET_CONNECTING;
+            netStateTimer = millis();
+            Serial.println("[WIFI] Yeni aga baglanilmaya calisiliyor: " + targetSSID);
+        }
     }
+    else if (currentNetState == NET_CONNECTING) {
+        ArduinoOTA.handle();
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("[WIFI] Baglandi! STA IP: " + WiFi.localIP().toString());
+            prefs.putString("ssid", targetSSID);
+            prefs.putString("pass", targetPass);
+            currentNetState = NET_SHOW_IP;
+            netStateTimer = millis();
+        } else if (now - netStateTimer > 30000) { // 30 saniye zaman aşımı
+            Serial.println("[WIFI] Baglanti basarisiz. AP Moduna geri donuluyor.");
+            WiFi.disconnect();
+            WiFi.mode(WIFI_AP);
+            WiFi.softAP("ESP32_RTK_BASE");
+            currentNetState = NET_AP;
+        }
+    }
+    else if (currentNetState == NET_SHOW_IP) {
+        ArduinoOTA.handle(); 
+        if (now - netStateTimer > 60000) { // 1 Dakika (60 sn) gösterim süresi
+            Serial.println("[WIFI] 1 dakika gosterim bitti. AP kapatiliyor, sadece STA modunda devam edilecek.");
+            WiFi.mode(WIFI_STA); 
+            currentNetState = NET_STA;
+        }
+    }
+    else if (currentNetState == NET_STA) {
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("[WIFI] Baglanti koptu! Yeniden baglanma deneniyor (Watchdog Aktif)...");
+            WiFi.disconnect();
+            WiFi.reconnect();
+            currentNetState = NET_RECONNECTING;
+            netStateTimer = millis();
+        }
+    }
+    else if (currentNetState == NET_RECONNECTING) {
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("[WIFI] Yeniden baglandi!");
+            currentNetState = NET_STA;
+        } else if (now - netStateTimer > 60000) { // 1 Dakika bağlanma denemesi zaman aşımı
+            Serial.println("[WIFI] 1 dakika icinde aga baglanamadi. Kurtarma icin AP aciliyor.");
+            WiFi.mode(WIFI_AP_STA);
+            WiFi.softAP("ESP32_RTK_BASE");
+            currentNetState = NET_AP;
+        }
+    }
+    // ---------------------------------------------------------
 
     if (ws.count() > 0) {
       ws.cleanupClients();
@@ -820,15 +977,82 @@ void setup() {
   pinMode(PPS_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(PPS_PIN), ppsKesmesi, RISING);
 
-  Serial.println("\n=== WI-FI BAGLANTISI BEKLENIYOR ===");
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-  Serial.println("\nBAGLANDI! Tarayicinizdan su adrese gidin:");
-  Serial.println(WiFi.localIP());
+  Serial.println("\n=== SİSTEM BAŞLATILIYOR ===");
+  
+  // WİFİ MANAGER VE HAFIZA YÜKLEMESİ
+  prefs.begin("wifi_creds", false);
+  targetSSID = prefs.getString("ssid", "");
+  targetPass = prefs.getString("pass", "");
 
+  if (targetSSID != "") {
+      currentNetState = NET_CONNECTING;
+      WiFi.mode(WIFI_AP_STA);
+      WiFi.softAP("ESP32_RTK_BASE"); 
+      WiFi.begin(targetSSID.c_str(), targetPass.c_str());
+      netStateTimer = millis();
+      Serial.println("Kayitli aga baglaniliyor: " + targetSSID);
+  } else {
+      currentNetState = NET_AP;
+      WiFi.mode(WIFI_AP);
+      WiFi.softAP("ESP32_RTK_BASE");
+      Serial.println("Kayitli ag yok. AP Modu baslatildi: ESP32_RTK_BASE");
+  }
+
+  // OTA YAPILANDIRMASI
+  ArduinoOTA.setHostname("ESP32-RTK-BASE");
+  ArduinoOTA.begin();
+
+  Serial.print("WiFi Ayar Sayfasi IP Adresi (AP Modu): ");
+  Serial.println(WiFi.softAPIP());
+
+  // HTTP İSTEK YÖNETİMİ
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-   request->send(200, "text/html", index_html);
+      if (currentNetState == NET_STA) {
+          request->send(200, "text/html", index_html);
+      } else if (currentNetState == NET_SHOW_IP) {
+          // Kullanıcı IP gösterimdeyken elle sayfayı yenilerse bu çıkacak
+          String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'></head><body style='background:#121212;color:#00ffcc;font-family:sans-serif;text-align:center;margin-top:50px;'>";
+          html += "<h2>✅ Basariyla Baglandi!</h2>";
+          html += "<p>ESP32 agdan su IP adresini aldi:</p>";
+          html += "<h1 style='color:#fff;'>" + WiFi.localIP().toString() + "</h1>";
+          html += "<p style='color:#aaa;'>Lütfen tarayicinizdan bu yeni IP adresine gidin. ESP32 kendi AP yayinini 1 dakika icinde kapatacaktir.</p>";
+          html += "</body></html>";
+          request->send(200, "text/html", html);
+      } else if (currentNetState == NET_CONNECTING) {
+          // Kullanıcı bağlanırken elle sayfayı yenilerse bu çıkacak (kendini 3 saniyede bir otomatik yeniler)
+          String html = "<html><head><meta http-equiv='refresh' content='3'><meta name='viewport' content='width=device-width, initial-scale=1.0'></head><body style='background:#121212;color:#ffdd00;text-align:center;font-family:sans-serif;margin-top:50px;'><h2>Ağa Bağlanılıyor...</h2><p>Lütfen bekleyin...</p></body></html>";
+          request->send(200, "text/html", html);
+      } else {
+          request->send(200, "text/html", wifi_html);
+      }
+  });
+
+  server.on("/scan", HTTP_GET, [](AsyncWebServerRequest *request){
+      int n = WiFi.scanNetworks(false, true); // Asenkron tarama
+      String json = "[";
+      for (int i = 0; i < n; ++i) {
+          if (i > 0) json += ",";
+          json += "\"" + WiFi.SSID(i) + "\"";
+      }
+      json += "]";
+      request->send(200, "application/json", json);
+  });
+
+  server.on("/connect", HTTP_GET, [](AsyncWebServerRequest *request){
+      if (request->hasParam("ssid") && request->hasParam("pass")) {
+          targetSSID = request->getParam("ssid")->value();
+          targetPass = request->getParam("pass")->value();
+          newCredentialsReceived = true;
+          request->send(200, "text/plain", "OK");
+      } else {
+          request->send(400, "text/plain", "Eksik parametre gönderildi.");
+      }
+  });
+
+  // Arka planda cihazın durumunu soran JSON uç noktası
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request){
+      String json = "{\"state\":" + String(currentNetState) + ",\"ip\":\"" + WiFi.localIP().toString() + "\"}";
+      request->send(200, "application/json", json);
   });
 
   server.on("/cmd", HTTP_GET, [](AsyncWebServerRequest *request){
