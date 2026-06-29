@@ -1,16 +1,13 @@
 #include <Arduino.h>
-#include <WiFi.h>
-#include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
-#include <TinyGPS++.h>
-#include <Preferences.h>
-#include <ArduinoOTA.h>
+#include "Config.h"
+#include "Globals.h"
+#include "WebUI.h"
+#include "GNSS_Core.h"
 
 // ==========================================
-// 1. USER SETTINGS & NETWORK STATE MANAGEMENT
+// GLOBAL DEĞİŞKENLERİN TANIMLANMASI
 // ==========================================
-enum NetState { NET_AP, NET_CONNECTING, NET_SHOW_IP, NET_STA, NET_RECONNECTING };
 NetState currentNetState = NET_AP;
 uint32_t netStateTimer = 0;
 String targetSSID = "";
@@ -18,24 +15,13 @@ String targetPass = "";
 Preferences prefs;
 bool newCredentialsReceived = false;
 
-// ==========================================
-// 2. HARDWARE AND OBJECT DEFINITIONS
-// ==========================================
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
-
 TinyGPSPlus gps;
-
-#define RXD2 17
-#define TXD2 16
-#define GNSS_BAUD 115200 
-#define PPS_PIN 27
-#define RTCM_PORT 2101
 
 WiFiServer rtcmServer(RTCM_PORT);
 WiFiClient tcpClients[3]; 
 
-// FreeRTOS Task, Mutex and Queue Definitions
 TaskHandle_t NetworkTaskHandle;
 SemaphoreHandle_t dataMutex; 
 SemaphoreHandle_t tcpMutex;  
@@ -43,90 +29,28 @@ QueueHandle_t termQueue;
 
 portMUX_TYPE ppsMux = portMUX_INITIALIZER_UNLOCKED; 
 
-// --- DUAL-BAND SUPPORTED SATELLITE DATA STRUCTURE ---
-struct SatData {
-  int id;
-  char sys[4]; 
-  int elev;   
-  int azim;   
-  int snr;    
-  int sig; 
-  uint32_t lastSeen; 
-};
-
-#define MAX_SATS 150
 SatData activeSats[MAX_SATS];
 int activeSatCount = 0;
-
-struct GpsSnapshot {
-  double lat, lon, alt, hdop;
-  bool validLoc, validAlt, validHdop, validTime;
-  uint8_t hour, min, sec;
-  uint8_t fixQual; 
-} safeGps;
+GpsSnapshot safeGps;
 
 uint32_t rtcmPaketSayaci = 0;
 volatile uint32_t sonPpsZamaniMicros = 0; 
 uint8_t globalFixQuality = 0; 
 
-// Counters for Core CPU Load Tracking
 uint32_t core1BusyTime = 0; 
 
-#define MAX_NMEA 256
 char nmeaBuff[MAX_NMEA];
 int nmeaIdx = 0;
 
+// ==========================================
+// KESMELER VE OLAYLAR
+// ==========================================
 void IRAM_ATTR ppsKesmesi() {
   portENTER_CRITICAL_ISR(&ppsMux);
   sonPpsZamaniMicros = micros(); 
   portEXIT_CRITICAL_ISR(&ppsMux);
 }
 
-// Mutex Protected Satellite Addition
-void addSat(const char* sys, int id, int elev, int azim, int snr, int sig) {
-  if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
-    uint32_t now = millis();
-    for (int i = 0; i < activeSatCount; i++) {
-      if (strcmp(activeSats[i].sys, sys) == 0 && activeSats[i].id == id && activeSats[i].sig == sig) {
-        activeSats[i].elev = elev; 
-        activeSats[i].azim = azim; 
-        activeSats[i].snr = snr;
-        activeSats[i].lastSeen = now;
-        xSemaphoreGive(dataMutex);
-        return;
-      }
-    }
-    if (activeSatCount < MAX_SATS) {
-      activeSats[activeSatCount].id = id;
-      strlcpy(activeSats[activeSatCount].sys, sys, sizeof(activeSats[0].sys));
-      activeSats[activeSatCount].elev = elev;
-      activeSats[activeSatCount].azim = azim;
-      activeSats[activeSatCount].snr = snr;
-      activeSats[activeSatCount].sig = sig; 
-      activeSats[activeSatCount].lastSeen = now;
-      activeSatCount++;
-    }
-    xSemaphoreGive(dataMutex);
-  }
-}
-
-void cleanOldSatellites() {
-  if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
-    uint32_t now = millis();
-    int newCount = 0;
-    for (int i = 0; i < activeSatCount; i++) {
-      if (now - activeSats[i].lastSeen <= 5000) {
-        activeSats[newCount++] = activeSats[i];
-      }
-    }
-    activeSatCount = newCount;
-    xSemaphoreGive(dataMutex);
-  }
-}
-
-// ==========================================
-// 3. NETWORK AND TERMINAL EVENTS
-// ==========================================
 void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
   if (type == WS_EVT_DATA) {
     AwsFrameInfo *info = (AwsFrameInfo*)arg;
@@ -140,524 +64,6 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
       Serial2.print("\r\n");
       Serial.print("[WS] Command Sent to Module: ");
       Serial.println(cmd);
-    }
-  }
-}
-
-// ==========================================
-// 4. EMBEDDED WEB PAGES (RTK & WIFI)
-// ==========================================
-const char wifi_html[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ESP32 RTK - WiFi Setup</title>
-    <style>
-        body { background-color: #121212; color: #00ffcc; font-family: 'Courier New', Courier, monospace; text-align: center; margin: 0; padding: 20px; }
-        .card { background: #1e1e1e; padding: 20px; border-radius: 8px; border: 1px solid #333; display: inline-block; text-align: left; max-width: 400px; width: 100%; box-sizing: border-box; }
-        h2 { color: #fff; text-align: center; border-bottom: 1px solid #444; padding-bottom: 10px; margin-top: 0; }
-        label { color: #aaa; font-size: 12px; display: block; margin-top: 10px; }
-        select, input { width: 100%; padding: 10px; margin: 5px 0 15px 0; background: #000; color: #00ffcc; border: 1px solid #444; border-radius: 4px; box-sizing: border-box; font-family: monospace; }
-        button { width: 100%; padding: 12px; background: #00ffcc; color: #000; border: none; border-radius: 4px; font-weight: bold; cursor: pointer; margin-bottom: 10px; }
-        button:hover { background: #00ccaa; }
-        .scan-btn { background: #444; color: #fff; }
-        .scan-btn:hover { background: #555; }
-        #status { text-align: center; color: #ffdd00; font-weight: bold; margin-top: 15px; font-size: 14px;}
-    </style>
-</head>
-<body>
-    <div class="card" id="mainCard">
-        <h2>📡 WiFi Setup</h2>
-        <button class="scan-btn" onclick="scanNetworks()">Scan Networks</button>
-        
-        <label for="networks">Found Networks:</label>
-        <select id="networks" onchange="document.getElementById('ssid').value = this.value;">
-            <option value="">Scan first...</option>
-        </select>
-        
-        <label for="ssid">SSID (Network Name):</label>
-        <input type="text" id="ssid" placeholder="Enter network name or select from list">
-        
-        <label for="pass">Password:</label>
-        <input type="password" id="pass" placeholder="Network password">
-        
-        <button onclick="connectWiFi()">Connect to Network</button>
-        <div id="status"></div>
-    </div>
-
-    <script>
-        function scanNetworks() {
-            document.getElementById('networks').innerHTML = '<option value="">Scanning... Please wait.</option>';
-            document.getElementById('status').innerText = "Scanning for nearby networks...";
-            fetch('/scan').then(response => response.json()).then(data => {
-                let options = '<option value="">Select a network...</option>';
-                data.forEach(network => {
-                    options += `<option value="${network}">${network}</option>`;
-                });
-                document.getElementById('networks').innerHTML = options;
-                document.getElementById('status').innerText = "Scan complete.";
-            }).catch(() => {
-                document.getElementById('status').innerText = "Scan error!";
-                document.getElementById('status').style.color = "#ff3333";
-            });
-        }
-
-        function checkStatus() {
-            fetch('/status').then(r => r.json()).then(data => {
-                if (data.state === 2) { 
-                    // NET_SHOW_IP State: Connection successful, show IP from its own broadcast
-                    document.body.innerHTML = "<div class='card' style='text-align:center;'><h2> Connected Successfully!</h2><p>ESP32 received the following IP address from the network:</p><h1 style='color:#fff;'>" + data.ip + "</h1><p style='color:#aaa; font-size:13px;'>Please go to this new IP address in your browser. The ESP32 will turn off its own access point in 1 minute and switch to normal mode.</p></div>";
-                } else if (data.state === 1) { 
-                    // NET_CONNECTING State: Still trying to connect
-                    document.getElementById('status').innerText = "Connecting to network, please wait...";
-                    setTimeout(checkStatus, 2000); // Ask again after 2 seconds
-                } else if (data.state === 0) { 
-                    // NET_AP State: Connection lost or wrong password
-                    document.getElementById('status').innerText = "Connection failed! Please check the password.";
-                    document.getElementById('status').style.color = "#ff3333";
-                }
-            }).catch(() => {
-                 setTimeout(checkStatus, 2000);
-            });
-        }
-
-        function connectWiFi() {
-            let ssid = document.getElementById('ssid').value.trim();
-            let pass = document.getElementById('pass').value.trim();
-            if (!ssid) {
-                alert("Please enter a network name (SSID).");
-                return;
-            }
-            document.getElementById('status').innerText = "Connection request sent. Waiting...";
-            document.getElementById('status').style.color = "#33ff33";
-            
-            fetch(`/connect?ssid=${encodeURIComponent(ssid)}&pass=${encodeURIComponent(pass)}`)
-            .then(() => {
-                // Request went successfully, now poll the device in the background until it gets an IP
-                setTimeout(checkStatus, 2000);
-            }).catch(() => {
-                document.getElementById('status').innerText = "Error occurred, device unreachable!";
-                document.getElementById('status').style.color = "#ff3333";
-            });
-        }
-    </script>
-</body>
-</html>
-)rawliteral";
-
-const char index_html[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ESP32 - RTK Telemetry</title>
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    <style>
-        body { background-color: #121212; color: #00ffcc; font-family: 'Courier New', Courier, monospace; margin: 0; padding: 10px; }
-        h2 { text-align: center; color: #fff; margin-bottom: 5px; }
-        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-        @media (max-width: 768px) { .grid { grid-template-columns: 1fr; } }
-        .card { background: #1e1e1e; padding: 15px; border-radius: 8px; border: 1px solid #333; position: relative; }
-        .card h3 { margin-top: 0; color: #aaa; font-size: 14px; border-bottom: 1px solid #444; padding-bottom: 5px;}
-        .value { font-size: 18px; color: #fff; font-weight: bold; }
-        .alert { color: #ff3333; }
-        .good { color: #33ff33; }
-        .sat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px;}
-        .sat-box { background: #2a2a2a; padding: 6px; border-radius: 6px; display: flex; flex-direction: column; border: 1px solid #333;}
-        .sat-box-title { font-size: 12px; color: #aaa; border-bottom: 1px solid #444; padding-bottom: 3px; margin-bottom: 4px; font-weight: bold; text-align: center;}
-        .sat-sig-row { display: flex; justify-content: space-between; font-size: 11px; color: #888; padding: 2px 0;}
-        .sat-sig-row span.val { color: #00ffcc; font-weight: bold; }
-        #map { height: 250px; border-radius: 8px; margin-top: 10px; z-index: 1;}
-        canvas { background: #1a1a1a; border-radius: 50%; display: block; margin: 0 auto; border: 2px solid #333;}
-        #terminal { height: 110px; overflow-y: auto; background: #000; color: #00ffcc; padding: 8px; border: 1px solid #444; border-radius: 4px; font-size: 12px; margin-top: 5px; font-family: monospace; }
-        .term-line { border-bottom: 1px dashed #222; padding-bottom: 3px; margin-bottom: 3px; word-wrap: break-word;}
-    </style>
-</head>
-<body>
-    <h2>📡 ESP32 - RTK BASE</h2>
-    <div class="grid">
-        <div class="card">
-            <h3>🌐 SYSTEM & LOCATION STATUS</h3>
-            <div>Latitude: <span id="lat" class="value">Waiting...</span></div>
-            <div>Longitude: <span id="lon" class="value">Waiting...</span></div>
-            <div>Altitude: <span id="alt" class="value">0.0</span> m</div>
-            <div>HDOP: <span id="hdop" class="value">0.0</span></div>
-            <hr style="border: 0; border-top: 1px solid #444; margin: 10px 0;">
-            <div>Fix Mode: <span id="f_mode" class="value alert">NO FIX</span></div>
-            <div>Fix Quality: <span id="f_qual" class="value alert" style="font-size: 16px;">INVALID</span></div>
-            <hr style="border: 0; border-top: 1px solid #444; margin: 10px 0;">
-            <div>PPS Status: <span id="pps_status" class="value alert">NO LOCK</span></div>
-            <div>Satellite Time (UTC): <span id="sat_time" class="value" style="color:#aaffaa">--:--:--</span></div>
-            <div>RTCM3 Stream: <span id="rtcm" class="value">0</span> pkt/sec</div>
-            <div>TCP Broadcast (Port 2101): <span id="tcp_clients" class="value" style="color:#00ffcc">0</span> Clients</div>
-            <div id="map"></div>
-            <h3 style="margin-top: 15px;">⌨️ SERIAL PORT TERMINAL</h3>
-            <div style="display: flex; gap: 5px;">
-                <input type="text" id="cmdInput" placeholder="$PQTMCFGSVIN..." style="flex: 1; padding: 5px; border-radius: 4px; border: 1px solid #444; background: #000; color: #00ffcc; font-family: monospace;">
-                <button onclick="sendCommand()" style="padding: 5px 15px; background: #00ffcc; color: #000; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">SEND</button>
-            </div>
-            <div id="terminal"></div>
-            <p style="font-size: 10px; color: #888; margin-top: 5px; margin-bottom: 0;">* Commands starting with ‘$’ are automatically appended with a checksum.</p>
-        </div>
-
-        <div class="card">
-            <h3>🛰️ ACTIVE SIGNAL DISTRIBUTION (Total: <span id="total_sats">0</span> Signals)</h3>
-            <div class="sat-grid">
-                <div class="sat-box">
-                    <div class="sat-box-title">GPS</div>
-                    <div class="sat-sig-row"><span>L1 C/A:</span><span class="val" id="gps-l1">0</span></div>
-                    <div class="sat-sig-row"><span>L5:</span><span class="val" id="gps-l5">0</span></div>
-                </div>
-                <div class="sat-box">
-                    <div class="sat-box-title">GLONASS</div>
-                    <div class="sat-sig-row"><span>L1/G1:</span><span class="val" id="glo-l1">0</span></div>
-                </div>
-                <div class="sat-box">
-                    <div class="sat-box-title">GALILEO</div>
-                    <div class="sat-sig-row"><span>E1:</span><span class="val" id="gal-e1">0</span></div>
-                    <div class="sat-sig-row"><span>E5a:</span><span class="val" id="gal-e5a">0</span></div>
-                </div>
-                <div class="sat-box">
-                    <div class="sat-box-title">BDS</div>
-                    <div class="sat-sig-row"><span>B1I:</span><span class="val" id="bei-b1">0</span></div>
-                    <div class="sat-sig-row"><span>B2a:</span><span class="val" id="bei-b2a">0</span></div>
-                </div>
-                <div class="sat-box">
-                    <div class="sat-box-title">QZSS</div>
-                    <div class="sat-sig-row"><span>L1 C/A:</span><span class="val" id="qzs-l1">0</span></div>
-                    <div class="sat-sig-row"><span>L5:</span><span class="val" id="qzs-l5">0</span></div>
-                </div>
-                <div class="sat-box">
-                    <div class="sat-box-title">NAVIC</div>
-                    <div class="sat-sig-row"><span>L5:</span><span class="val" id="nav-l5">0</span></div>
-                </div>
-                <div class="sat-box" style="border-color: #4169E1;">
-                    <div class="sat-box-title" style="color: #66aaff;">SBAS (EGNOS)</div>
-                    <div class="sat-sig-row"><span>L1:</span><span class="val" id="sba-l1" style="color:#ffffff;">0</span></div>
-                </div>
-            </div>
-            
-            <div style="text-align: right; font-size: 11px; color: #888; margin-top: 5px; padding-right: 5px;">
-                CPU Load -> C0(Network): <span id="cpu0_usage" style="color: #00ffcc; font-weight: bold;">0%</span> | C1(GNSS): <span id="cpu1_usage" style="color: #00ffcc; font-weight: bold;">0%</span>
-            </div>
-
-            <h3 style="margin-top: 15px;">🌌 SKYVIEW (Live Radar)</h3>
-            <canvas id="skyview" width="500" height="500"></canvas>
-        </div>
-    </div>
-
-    <script>
-        var map = L.map('map').setView([41.0, 28.9], 2);
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
-        var marker = L.marker([41.0, 28.9]).addTo(map);
-        var firstLock = false;
-
-        var flags = {};
-        var flagUrls = {
-            "GP": "https://flagcdn.com/w40/us.png", "GL": "https://flagcdn.com/w40/ru.png", 
-            "GA": "https://flagcdn.com/w40/eu.png", "GB": "https://flagcdn.com/w40/cn.png", 
-            "GI": "https://flagcdn.com/w40/in.png", "GQ": "https://flagcdn.com/w40/jp.png",
-            "SB": "https://flagcdn.com/w40/eu.png"
-        };
-        for(let key in flagUrls){ let img = new Image(); img.src = flagUrls[key]; flags[key] = img; }
-
-        function drawSkyview(skyData) {
-            var canvas = document.getElementById("skyview");
-            var ctx = canvas.getContext("2d");
-            var cx = canvas.width / 2; var cy = canvas.height / 2; var r = cx - 25; 
-            
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            ctx.strokeStyle = "#444"; ctx.lineWidth = 1;
-            [r, r*0.66, r*0.33].forEach(rad => { ctx.beginPath(); ctx.arc(cx, cy, rad, 0, 2*Math.PI); ctx.stroke(); });
-            ctx.beginPath(); ctx.moveTo(cx, cy-r); ctx.lineTo(cx, cy+r); ctx.stroke();
-            ctx.beginPath(); ctx.moveTo(cx-r, cy); ctx.lineTo(cx+r, cy); ctx.stroke();
-
-            if(!skyData) return;
-
-            skyData.forEach(sat => {
-                var satR = r * (1 - (sat.e / 90.0));
-                var rad = (sat.a - 90) * Math.PI / 180.0;
-                var x = cx + satR * Math.cos(rad);
-                var y = cy + satR * Math.sin(rad);
-
-                var balonYaricap = 10; 
-                
-                var glowColor = sat.s === "SB" ? "rgba(65, 105, 225, 0.9)" : 
-                                sat.sn > 35 ? "rgba(0, 255, 0, 0.7)" : 
-                                sat.sn > 25 ? "rgba(255, 255, 0, 0.7)" : "rgba(255, 0, 0, 0.7)"; 
-
-                ctx.save(); ctx.shadowBlur = (sat.sn / 2) + 5; ctx.shadowColor = glowColor; ctx.fillStyle = glowColor;
-                ctx.beginPath(); ctx.arc(x, y, balonYaricap + 2, 0, 2*Math.PI); ctx.fill(); ctx.restore(); 
-
-                ctx.save(); ctx.beginPath(); ctx.arc(x, y, balonYaricap, 0, 2*Math.PI); ctx.clip(); 
-                if(flags[sat.s] && flags[sat.s].complete) {
-                    ctx.drawImage(flags[sat.s], x - balonYaricap, y - balonYaricap, balonYaricap*2, balonYaricap*2);
-                } else { ctx.fillStyle = "#888"; ctx.fill(); }
-                ctx.restore(); 
-
-                ctx.beginPath(); ctx.arc(x, y, balonYaricap, 0, 2*Math.PI); ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5; ctx.stroke();
-
-                var sysPrefix = sat.s === "GP" ? "G" : sat.s === "GL" ? "R" : sat.s === "GA" ? "E" : sat.s === "GB" ? "B" : sat.s === "GI" ? "I" : sat.s === "GQ" ? "Q" : sat.s === "SB" ? "S" : "U";
-                ctx.fillStyle = "#eee"; ctx.font = "bold 11px Arial"; ctx.textAlign = "left";
-                ctx.fillText(sysPrefix + sat.id, x + balonYaricap + 4, y + 4);
-            });
-        }
-        drawSkyview();
-
-        var gateway = `ws://${window.location.hostname}/ws`;
-        var websocket;
-        function initWebSocket() {
-            websocket = new WebSocket(gateway);
-            websocket.onopen = function(event) { 
-                logTerminal("<span style='color:#33ff33;'>[SYSTEM] ESP32 Connection Established.</span>"); 
-                
-                setTimeout(function() {
-                    let versiyonKomutu = "$PQTMVERNO*58";
-                    websocket.send(versiyonKomutu); 
-                    logTerminal("<span style='color:#fff; font-weight:bold;'>TX:</span> <span style='color:#00ffcc;'>" + versiyonKomutu + "</span>");
-                }, 1000);
-            };
-            websocket.onclose = function(event) { logTerminal("<span style='color:#ffaa00;'>[SYSTEM] Connection Lost! Reconnecting...</span>"); setTimeout(initWebSocket, 2000); };
-            websocket.onmessage = onMessage;
-        }
-
-        function sendCommand() {
-            let cmdInput = document.getElementById('cmdInput');
-            let cmd = cmdInput.value.trim();
-            if (cmd) {
-                let finalCmd = cmd;
-                if (cmd.startsWith('$') && !cmd.includes('*')) {
-                    let checksum = 0;
-                    for (let i = 1; i < cmd.length; i++) checksum ^= cmd.charCodeAt(i);
-                    let hexCS = checksum.toString(16).toUpperCase().padStart(2, '0');
-                    finalCmd = cmd + '*' + hexCS;
-                }
-                fetch('/cmd?c=' + encodeURIComponent(finalCmd))
-                .then(response => { if(response.ok) logTerminal("<span style='color:#33ff33; font-weight:bold;'>TX:</span> <span style='color:#00ffcc;'>" + finalCmd + "</span>"); })
-                .catch(error => { logTerminal("<span style='color:#ff3333;'>ERROR: Module unreachable!</span>"); });
-                cmdInput.value = ""; 
-            }
-        }
-        document.getElementById("cmdInput").addEventListener("keyup", function(event) { if (event.key === "Enter") sendCommand(); });
-
-        function logTerminal(msg) {
-            var term = document.getElementById('terminal');
-            var timeStr = new Date().toLocaleTimeString('en-US', { hour12: false });
-            term.innerHTML += "<div class='term-line'><span style='color:#888; font-size:10px;'>[" + timeStr + "]</span> " + msg + "</div>";
-            
-            while(term.children.length > 100) {
-                term.removeChild(term.firstChild);
-            }
-            term.scrollTop = term.scrollHeight; 
-        }
-
-        function onMessage(event) {
-            if (typeof event.data === "string" && event.data.startsWith("TERM:")) {
-                let msg = event.data.substring(5); 
-                logTerminal("<span style='color:#ff3333; font-weight:bold;'>RX:</span> <span style='color:#fff;'>" + msg + "</span>");
-                return; 
-            }
-            var data;
-            try { data = JSON.parse(event.data); } catch(e) { return; }
-
-            if (data.lat !== undefined) {
-                document.getElementById('lat').innerText = data.lat.toFixed(6); 
-                document.getElementById('lon').innerText = data.lon.toFixed(6);
-                document.getElementById('alt').innerText = data.alt.toFixed(2); 
-                document.getElementById('hdop').innerText = data.hdop.toFixed(2);
-                document.getElementById('rtcm').innerText = data.rtcm; 
-                document.getElementById('tcp_clients').innerText = data.tcp_clients;
-                if(data.sat_time) document.getElementById('sat_time').innerText = data.sat_time;
-                
-                if(data.f_mode) {
-                    var fModeEl = document.getElementById('f_mode');
-                    fModeEl.innerText = data.f_mode;
-                    fModeEl.className = (data.f_mode === "3D" || data.f_mode === "2D") ? "value good" : "value alert";
-
-                    var fQualEl = document.getElementById('f_qual');
-                    fQualEl.innerText = data.f_qual;
-                    
-                    if (data.f_qual.includes("RTK FIXED")) fQualEl.style.color = "#c688ff"; 
-                    else if (data.f_qual.includes("RTK FLOAT") || data.f_qual.includes("DGNSS")) fQualEl.style.color = "#00ffcc";
-                    else if (data.f_qual.includes("GPS")) fQualEl.style.color = "#ffdd00";
-                    else fQualEl.style.color = "#ff3333";
-                }
-
-                if(data.cpu0 !== undefined && data.cpu1 !== undefined) {
-                    var cpu0El = document.getElementById('cpu0_usage');
-                    cpu0El.innerText = data.cpu0 + '%';
-                    if (data.cpu0 > 80) cpu0El.style.color = "#ff3333"; 
-                    else if (data.cpu0 > 50) cpu0El.style.color = "#ffdd00"; 
-                    else cpu0El.style.color = "#00ffcc"; 
-
-                    var cpu1El = document.getElementById('cpu1_usage');
-                    cpu1El.innerText = data.cpu1 + '%';
-                    if (data.cpu1 > 80) cpu1El.style.color = "#ff3333"; 
-                    else if (data.cpu1 > 50) cpu1El.style.color = "#ffdd00"; 
-                    else cpu1El.style.color = "#00ffcc"; 
-                }
-
-                var ppsEl = document.getElementById('pps_status');
-                if(data.pps_active) {
-                    ppsEl.innerText = "ACTIVE (LOCKED)"; ppsEl.className = "value good";
-                } else {
-                    ppsEl.innerText = "WAITING..."; ppsEl.className = "value alert";
-                }
-
-                let t = data.sats;
-                document.getElementById('gps-l1').innerText = t.gps.L1;
-                document.getElementById('gps-l5').innerText = t.gps.L5;
-                document.getElementById('glo-l1').innerText = t.glo.L1;
-                document.getElementById('gal-e1').innerText = t.gal.E1;
-                document.getElementById('gal-e5a').innerText = t.gal.E5a;
-                document.getElementById('bei-b1').innerText = t.bei.B1;
-                document.getElementById('bei-b2a').innerText = t.bei.B2a;
-                document.getElementById('qzs-l1').innerText = t.qzs.L1;
-                document.getElementById('qzs-l5').innerText = t.qzs.L5;
-                document.getElementById('nav-l5').innerText = t.nav.L5;
-                
-                document.getElementById('sba-l1').innerText = t.sba ? t.sba.L1 : 0;
-                
-                document.getElementById('total_sats').innerText = t.gps.L1 + t.gps.L5 + t.glo.L1 + t.gal.E1 + t.gal.E5a + t.bei.B1 + t.bei.B2a + t.qzs.L1 + t.qzs.L5 + t.nav.L5 + (t.sba ? t.sba.L1 : 0);
-              
-                if(data.lat !== 0.0 && data.lon !== 0.0) {
-                    var newLatLng = new L.LatLng(data.lat, data.lon); marker.setLatLng(newLatLng);
-                    if(!firstLock) { map.setView(newLatLng, 18); firstLock = true; }            
-                }
-                if(data.sky) drawSkyview(data.sky);
-            }
-        }
-        window.addEventListener('load', initWebSocket);
-    </script>
-</body>
-</html>
-)rawliteral";
-
-// ==========================================
-// 5. SECURE NMEA PARSER
-// ==========================================
-bool isChecksumValid(const char* sentence) {
-  int len = strlen(sentence);
-  if (len < 8) return false; 
-  
-  int starIndex = -1;
-  for (int i = 0; i < len; i++) {
-    if (sentence[i] == '*') {
-      starIndex = i;
-      break;
-    }
-  }
-  
-  if (starIndex == -1 || starIndex > len - 3) return false;
-
-  char c1 = sentence[starIndex + 1];
-  char c2 = sentence[starIndex + 2];
-  if (!isxdigit(c1) || !isxdigit(c2)) return false; 
-  
-  uint8_t calculatedCS = 0;
-  for (int i = 1; i < starIndex; i++) {
-    calculatedCS ^= sentence[i];
-  }
-  
-  char hexStr[3] = {c1, c2, '\0'};
-  uint8_t providedCS = (uint8_t)strtol(hexStr, NULL, 16);
-  
-  return (calculatedCS == providedCS); 
-}
-
-void uyduTipleriniAyristir(const char* nmea) {
-  if (strstr(nmea, "GSV") != NULL) {
-    const char* sys = "UN";
-    if (strncmp(nmea, "$GP", 3) == 0) sys = "GP";
-    else if (strncmp(nmea, "$GL", 3) == 0) sys = "GL";
-    else if (strncmp(nmea, "$GA", 3) == 0) sys = "GA";
-    else if (strncmp(nmea, "$GB", 3) == 0 || strncmp(nmea, "$BD", 3) == 0) sys = "GB";
-    else if (strncmp(nmea, "$GI", 3) == 0) sys = "GI";
-    else if (strncmp(nmea, "$GQ", 3) == 0) sys = "GQ";
-    else if (strncmp(nmea, "$SB", 3) == 0) sys = "SB"; 
-
-    int commas[25]; 
-    int cCount = 0;
-    int len = strlen(nmea);
-    int starIdx = -1;
-    
-    for (int i = 0; i < len; i++) {
-      if (nmea[i] == ',') {
-        if (cCount < 25) commas[cCount++] = i;
-      } else if (nmea[i] == '*') {
-        starIdx = i;
-      }
-    }
-
-    if (starIdx < 0) return;
-
-    bool hasSignalId = false;
-    int sig_id = 1; 
-    
-    if (cCount >= 4) {
-      int lastFieldLen = starIdx - commas[cCount - 1] - 1;
-      if ((cCount - 3) % 4 == 1 && lastFieldLen > 0 && lastFieldLen <= 2) { 
-        char sigStr[4] = {0};
-        strncpy(sigStr, nmea + commas[cCount - 1] + 1, lastFieldLen);
-        
-        bool isHex = true;
-        for(int k = 0; k < lastFieldLen; k++) {
-            if(!isxdigit(sigStr[k])) isHex = false;
-        }
-        
-        if (isHex) {
-          hasSignalId = true;
-          sig_id = strtol(sigStr, NULL, 16);
-        }
-      }
-    }
-
-    for (int i = 4; i < cCount; i += 4) {
-      if (i + 2 < cCount) {
-        int id = atoi(nmea + commas[i-1] + 1);
-        int elev = atoi(nmea + commas[i] + 1);
-        int azim = atoi(nmea + commas[i+1] + 1);
-        int snr = 0;
-        
-        if (i + 3 < cCount) {
-          snr = atoi(nmea + commas[i+2] + 1);
-        } else if (!hasSignalId) {
-          char snrStr[8] = {0};
-          int snrLen = starIdx - commas[i+2] - 1;
-          if(snrLen > 0 && snrLen < 8) {
-              strncpy(snrStr, nmea + commas[i+2] + 1, snrLen);
-              snr = atoi(snrStr);
-          }
-        }
-        
-        if (id > 0) {
-          const char* finalSys = sys;
-
-          if (strcmp(sys, "GP") == 0 || strcmp(sys, "UN") == 0 || strcmp(sys, "SB") == 0) {
-              if (id == 121 || id == 123 || id == 126 || id == 136 || 
-                  id == 131 || id == 133 || id == 135 ||              
-                  id == 127 || id == 128 || id == 157 ||              
-                  id == 129 || id == 137 ||                           
-                  id == 134 || id == 149 ||                           
-                  id == 130 || id == 143) {                           
-                  finalSys = "SB"; 
-              } 
-              else if (id >= 33 && id <= 64) {                          
-                  finalSys = "SB"; 
-                  id += 87; 
-              } 
-              else if (id == 183 || id == 193 || (id >= 193 && id <= 200)) {
-                  finalSys = "GQ"; 
-              }
-          }
-          
-          addSat(finalSys, id, elev, azim, snr, sig_id); 
-        }
-      }
     }
   }
 }
@@ -678,9 +84,6 @@ void networkTaskCode(void * parameter) {
     uint32_t c0TaskStart = micros();
     uint32_t now = millis();
 
-    // ---------------------------------------------------------
-    // WIFI MANAGER AND WATCHDOG STATE MACHINE (ONLY CORE 0)
-    // ---------------------------------------------------------
     if (currentNetState == NET_AP) {
         ArduinoOTA.handle();
         if (newCredentialsReceived) {
@@ -700,7 +103,7 @@ void networkTaskCode(void * parameter) {
             prefs.putString("pass", targetPass);
             currentNetState = NET_SHOW_IP;
             netStateTimer = millis();
-        } else if (now - netStateTimer > 30000) { // 30 seconds timeout
+        } else if (now - netStateTimer > 30000) { 
             Serial.println("[WIFI] Connection failed. Returning to AP Mode.");
             WiFi.disconnect();
             WiFi.mode(WIFI_AP);
@@ -710,7 +113,7 @@ void networkTaskCode(void * parameter) {
     }
     else if (currentNetState == NET_SHOW_IP) {
         ArduinoOTA.handle(); 
-        if (now - netStateTimer > 60000) { // 1 Minute (60 sec) display time
+        if (now - netStateTimer > 60000) { 
             Serial.println("[WIFI] 1 minute display over. AP closing, continuing in STA mode only.");
             WiFi.mode(WIFI_STA); 
             currentNetState = NET_STA;
@@ -729,14 +132,13 @@ void networkTaskCode(void * parameter) {
         if (WiFi.status() == WL_CONNECTED) {
             Serial.println("[WIFI] Reconnected!");
             currentNetState = NET_STA;
-        } else if (now - netStateTimer > 60000) { // 1 Minute connection attempt timeout
+        } else if (now - netStateTimer > 60000) { 
             Serial.println("[WIFI] Could not connect to network in 1 minute. Opening AP for recovery.");
             WiFi.mode(WIFI_AP_STA);
             WiFi.softAP("ESP32_RTK_BASE");
             currentNetState = NET_AP;
         }
     }
-    // ---------------------------------------------------------
 
     if (ws.count() > 0) {
       ws.cleanupClients();
@@ -911,59 +313,8 @@ void networkTaskCode(void * parameter) {
 }
 
 // ==========================================
-// 6. SETUP
+// SETUP
 // ==========================================
-
-bool sendGnssCommand(const char* cmd, unsigned long timeoutMs = 1000) {
-  while(Serial2.available()) Serial2.read(); 
-  
-  Serial2.print(cmd);
-  Serial2.print("\r\n");
-  Serial.print("[GNSS-TX] "); Serial.println(cmd);
-
-  char expectedAck[32] = {0};
-  
-  if (strncmp(cmd, "$PAIR", 5) == 0) {
-    char cmdId[4] = {0};
-    strncpy(cmdId, cmd + 5, 3);
-    snprintf(expectedAck, sizeof(expectedAck), "$PAIR001,%s,0", cmdId);
-  } 
-  else if (strncmp(cmd, "$PQTM", 5) == 0) {
-    int endIdx = 0;
-    while(cmd[endIdx] != ',' && cmd[endIdx] != '*' && cmd[endIdx] != '\0' && endIdx < 31) {
-      expectedAck[endIdx] = cmd[endIdx];
-      endIdx++;
-    }
-    expectedAck[endIdx] = '\0';
-    strcat(expectedAck, ",OK"); 
-  } 
-  else {
-    strcpy(expectedAck, "OK");
-  }
-
-  unsigned long start = millis();
-  String line = "";
-  
-  while (millis() - start < timeoutMs) {
-    if (Serial2.available()) {
-      char c = Serial2.read();
-      if (c == '\n') {
-        if (line.indexOf(expectedAck) != -1) {
-          Serial.print("[GNSS-RX] ACKNOWLEDGED: "); Serial.println(line);
-          return true;
-        }
-        line = ""; 
-      } else if (c != '\r') {
-        line += c;
-      }
-    }
-  }
-  
-  Serial.print("[GNSS-ERR] TIMEOUT! Module did not acknowledge: ");
-  Serial.println(expectedAck);
-  return false;
-}
-
 void setup() {
   Serial.begin(115200);
   
@@ -979,7 +330,6 @@ void setup() {
 
   Serial.println("\n=== SYSTEM STARTING ===");
   
-  // WIFI MANAGER AND MEMORY LOAD
   prefs.begin("wifi_creds", false);
   targetSSID = prefs.getString("ssid", "");
   targetPass = prefs.getString("pass", "");
@@ -998,19 +348,16 @@ void setup() {
       Serial.println("No saved network. AP Mode started: ESP32_RTK_BASE");
   }
 
-  // OTA CONFIGURATION
   ArduinoOTA.setHostname("ESP32-RTK-BASE");
   ArduinoOTA.begin();
 
   Serial.print("WiFi Settings Page IP Address (AP Mode): ");
   Serial.println(WiFi.softAPIP());
 
-  // HTTP REQUEST MANAGEMENT
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
       if (currentNetState == NET_STA) {
           request->send(200, "text/html", index_html);
       } else if (currentNetState == NET_SHOW_IP) {
-          // If the user manually refreshes the page while showing IP, this will appear
           String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'></head><body style='background:#121212;color:#00ffcc;font-family:sans-serif;text-align:center;margin-top:50px;'>";
           html += "<h2>✅ Connected Successfully!</h2>";
           html += "<p>ESP32 received the following IP address from the network:</p>";
@@ -1019,7 +366,6 @@ void setup() {
           html += "</body></html>";
           request->send(200, "text/html", html);
       } else if (currentNetState == NET_CONNECTING) {
-          // If the user manually refreshes while connecting, this will appear (auto-refreshes every 3 seconds)
           String html = "<html><head><meta http-equiv='refresh' content='3'><meta name='viewport' content='width=device-width, initial-scale=1.0'></head><body style='background:#121212;color:#ffdd00;text-align:center;font-family:sans-serif;margin-top:50px;'><h2>Connecting to Network...</h2><p>Please wait...</p></body></html>";
           request->send(200, "text/html", html);
       } else {
@@ -1028,7 +374,7 @@ void setup() {
   });
 
   server.on("/scan", HTTP_GET, [](AsyncWebServerRequest *request){
-      int n = WiFi.scanNetworks(false, true); // Asynchronous scan
+      int n = WiFi.scanNetworks(false, true); 
       String json = "[";
       for (int i = 0; i < n; ++i) {
           if (i > 0) json += ",";
@@ -1049,7 +395,6 @@ void setup() {
       }
   });
 
-  // JSON endpoint polling the device status in the background
   server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request){
       String json = "{\"state\":" + String(currentNetState) + ",\"ip\":\"" + WiFi.localIP().toString() + "\"}";
       request->send(200, "application/json", json);
@@ -1133,7 +478,6 @@ void loop() {
     
     size_t len = Serial2.read(buf, bytesAvailable);
 
-    // ENGINEERING FIX: Unlimited write block completely terminating interruptions in the RTCM stream
     if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
       for (int i = 0; i < 3; i++) {
         if (tcpClients[i].connected()) {
