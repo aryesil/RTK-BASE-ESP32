@@ -22,24 +22,68 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
 }
 
 void setupWebServer() {
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-      if (currentNetState == NET_STA) {
-          request->send(200, "text/html", index_html);
-      } else if (currentNetState == NET_SHOW_IP) {
-          String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'></head><body style='background:#121212;color:#00ffcc;font-family:sans-serif;text-align:center;margin-top:50px;'>";
-          html += "<h2>Connected Successfully!</h2>";
-          html += "<p>ESP32 received the following IP address from the network:</p>";
-          html += "<h1 style='color:#fff;'>" + WiFi.localIP().toString() + "</h1>";
-          html += "<p style='color:#aaa;'>Please go to this new IP address in your browser. The ESP32 will turn off its own AP broadcast in 1 minute.</p>";
-          html += "</body></html>";
-          request->send(200, "text/html", html);
-      } else if (currentNetState == NET_CONNECTING) {
-          String html = "<html><head><meta http-equiv='refresh' content='3'><meta name='viewport' content='width=device-width, initial-scale=1.0'></head><body style='background:#121212;color:#ffdd00;text-align:center;font-family:sans-serif;margin-top:50px;'><h2>Connecting to Network...</h2><p>Please wait...</p></body></html>";
-          request->send(200, "text/html", html);
-      } else {
-          request->send(200, "text/html", wifi_html);
-      }
-  });
+server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+
+    IPAddress clientIP = request->client()->remoteIP();
+    IPAddress apIP = WiFi.softAPIP();
+
+    bool clientOnAP =
+        clientIP[0] == apIP[0] &&
+        clientIP[1] == apIP[1] &&
+        clientIP[2] == apIP[2];
+
+    if (currentNetState == NET_STA) {
+        request->send(200, "text/html", index_html);
+    }
+
+    else if (currentNetState == NET_SHOW_IP) {
+
+        if (!clientOnAP) {
+            request->send(200, "text/html", index_html);
+            return;
+        }
+
+        String html =
+        "<html>"
+        "<head>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+        "</head>"
+        "<body style='background:#121212;color:#00ffcc;font-family:sans-serif;text-align:center;margin-top:50px;'>"
+        "<h2>Connected Successfully!</h2>"
+        "<p>ESP32 received the following IP address from the network:</p>"
+        "<h1 style='color:#fff;'>" + WiFi.localIP().toString() + "</h1>"
+        "<p style='color:#aaa;'>"
+        "Please go to this new IP address in your browser."
+        "<br><br>"
+        "The ESP32 will disable its AP mode in 1 minute."
+        "</p>"
+        "</body>"
+        "</html>";
+
+        request->send(200, "text/html", html);
+    }
+
+    else if (currentNetState == NET_CONNECTING) {
+
+        String html =
+        "<html>"
+        "<head>"
+        "<meta http-equiv='refresh' content='3'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+        "</head>"
+        "<body style='background:#121212;color:#ffdd00;text-align:center;font-family:sans-serif;margin-top:50px;'>"
+        "<h2>Connecting to Network...</h2>"
+        "<p>Please wait...</p>"
+        "</body>"
+        "</html>";
+
+        request->send(200, "text/html", html);
+    }
+
+    else {
+        request->send(200, "text/html", wifi_html);
+    }
+});
 
   server.on("/scan", HTTP_GET, [](AsyncWebServerRequest *request){
       int n = WiFi.scanNetworks(false, true); 

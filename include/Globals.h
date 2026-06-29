@@ -10,7 +10,7 @@
 #include <Config.h>
 
 // ==========================================
-// AĞ DURUMLARI
+// NETWORK STATUSES
 // ==========================================
 enum NetState { NET_AP, NET_CONNECTING, NET_SHOW_IP, NET_STA, NET_RECONNECTING };
 extern NetState currentNetState;
