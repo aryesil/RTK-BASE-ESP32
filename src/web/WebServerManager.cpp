@@ -22,7 +22,7 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
 }
 
 void setupWebServer() {
-server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
 
     IPAddress clientIP = request->client()->remoteIP();
     IPAddress apIP = WiFi.softAPIP();
@@ -34,62 +34,103 @@ server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
 
     if (currentNetState == NET_STA) {
         request->send(200, "text/html", index_html);
+        return;
     }
 
-    else if (currentNetState == NET_SHOW_IP) {
+    if (currentNetState == NET_SHOW_IP) {
 
+        // STA users can use direct telemetry.
         if (!clientOnAP) {
             request->send(200, "text/html", index_html);
             return;
         }
 
-        String html =
-        "<html>"
-        "<head>"
-        "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
-        "</head>"
-        "<body style='background:#121212;color:#00ffcc;font-family:sans-serif;text-align:center;margin-top:50px;'>"
-        "<h2>Connected Successfully!</h2>"
-        "<p>ESP32 received the following IP address from the network:</p>"
-        "<h1 style='color:#fff;'>" + WiFi.localIP().toString() + "</h1>"
-        "<p style='color:#aaa;'>"
-        "Please go to this new IP address in your browser."
-        "<br><br>"
-        "The ESP32 will disable its AP mode in 1 minute."
-        "</p>"
-        "</body>"
-        "</html>";
+        // AP users IP screen + WiFi reset button
+        String html;
+
+        html += "<html><head>";
+        html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+        html += "</head><body style='background:#121212;color:#00ffcc;font-family:sans-serif;text-align:center;margin-top:50px;'>";
+
+        html += "<h2>Connected Successfully!</h2>";
+        html += "<p>Device connected to WiFi network.</p>";
+
+        html += "<h1 style='color:white;'>";
+        html += WiFi.localIP().toString();
+        html += "</h1>";
+
+        html += "<p style='color:#aaa;'>";
+        html += "Open this IP to access telemetry UI.<br><br>";
+        html += "AP will close automatically in 1 minute.";
+        html += "</p>";
+
+        html += R"rawliteral(
+<button onclick="resetWifi()"
+style="padding:12px 20px;font-size:16px;background:#ff4444;color:white;border:none;border-radius:6px;margin-top:20px;">
+Select Another WiFi
+</button>
+
+<script>
+function resetWifi(){
+  if(confirm("Disconnect WiFi and return to setup?")){
+    fetch('/resetwifi').then(() => {
+      document.body.innerHTML =
+      "<h2 style='color:white'>Restarting AP mode...</h2>" +
+      "<p>Please reconnect to ESP32_RTK_BASE</p>";
+    });
+  }
+}
+</script>
+)rawliteral";
+
+        html += "</body></html>";
 
         request->send(200, "text/html", html);
+        return;
     }
 
-    else if (currentNetState == NET_CONNECTING) {
-
-        String html =
-        "<html>"
-        "<head>"
-        "<meta http-equiv='refresh' content='3'>"
-        "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
-        "</head>"
-        "<body style='background:#121212;color:#ffdd00;text-align:center;font-family:sans-serif;margin-top:50px;'>"
-        "<h2>Connecting to Network...</h2>"
-        "<p>Please wait...</p>"
-        "</body>"
-        "</html>";
-
-        request->send(200, "text/html", html);
+    if (currentNetState == NET_CONNECTING) {
+        request->send(200, "text/html",
+            "<html><body style='background:#121212;color:#ffdd00;text-align:center;margin-top:50px;'>"
+            "<h2>Connecting...</h2><p>Please wait</p></body></html>"
+        );
+        return;
     }
 
-    else {
-        request->send(200, "text/html", wifi_html);
-    }
-});
+    request->send(200, "text/html", wifi_html);
+  });
 
+
+  // WIFI RESET ENDPOINT
+  server.on("/resetwifi", HTTP_GET, [](AsyncWebServerRequest *request){
+
+    request->send(200, "text/plain", "OK");
+
+    Serial.println("[WIFI] Reset requested");
+
+    prefs.remove("ssid");
+    prefs.remove("pass");
+
+    targetSSID = "";
+    targetPass = "";
+
+    WiFi.disconnect(true, true);
+
+    currentNetState = NET_AP;
+
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("ESP32_RTK_BASE");
+
+    Serial.println("[WIFI] Back to AP mode");
+  });
+
+
+  // --- EXISTING ROUTES ---
   server.on("/scan", HTTP_GET, [](AsyncWebServerRequest *request){
-      int n = WiFi.scanNetworks(false, true); 
+      int n = WiFi.scanNetworks(false, true);
       String json = "[";
-      for (int i = 0; i < n; ++i) {
-          if (i > 0) json += ",";
+      for (int i = 0; i < n; i++) {
+          if (i) json += ",";
           json += "\"" + WiFi.SSID(i) + "\"";
       }
       json += "]";
@@ -103,27 +144,28 @@ server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
           newCredentialsReceived = true;
           request->send(200, "text/plain", "OK");
       } else {
-          request->send(400, "text/plain", "Missing parameter sent.");
+          request->send(400, "text/plain", "Missing parameter");
       }
   });
 
   server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request){
-      String json = "{\"state\":" + String(currentNetState) + ",\"ip\":\"" + WiFi.localIP().toString() + "\"}";
+      String json = "{\"state\":" + String(currentNetState) +
+                    ",\"ip\":\"" + WiFi.localIP().toString() + "\"}";
       request->send(200, "application/json", json);
   });
 
   server.on("/cmd", HTTP_GET, [](AsyncWebServerRequest *request){
     if(request->hasParam("c")){
       String cmdStr = request->getParam("c")->value();
-      Serial2.print(cmdStr); 
-      Serial2.print("\r\n"); 
-      request->send(200, "text/plain", "OK"); 
+      Serial2.print(cmdStr);
+      Serial2.print("\r\n");
+      request->send(200, "text/plain", "OK");
     } else {
       request->send(400, "text/plain", "EMPTY");
     }
   });
 
-  ws.onEvent(onWsEvent); 
+  ws.onEvent(onWsEvent);
   server.addHandler(&ws);
   server.begin();
 }
