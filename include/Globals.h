@@ -72,3 +72,5 @@ extern uint32_t core1BusyTime;
 
 extern char nmeaBuff[MAX_NMEA];
 extern int nmeaIdx;
+
+void IRAM_ATTR ppsKesmesi();

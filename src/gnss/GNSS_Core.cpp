@@ -1,4 +1,5 @@
 #include <gnss/GNSS_Core.h>
+#include <Globals.h>
 
 void addSat(const char* sys, int id, int elev, int azim, int snr, int sig) {
   if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
@@ -211,4 +212,20 @@ bool sendGnssCommand(const char* cmd, unsigned long timeoutMs) {
   Serial.print("[GNSS-ERR] TIMEOUT! Module did not acknowledge: ");
   Serial.println(expectedAck);
   return false;
+}
+
+void applyGnssConfiguration() {
+    const char* initCommands[] = {
+        "$PAIR062,0,1*3F", "$PAIR062,1,1*3E", "$PAIR062,2,1*3D", 
+        "$PAIR062,3,1*3C", "$PAIR062,4,1*3B", "$PAIR062,6,1*39", 
+        "$PAIR062,7,1*38", "$PAIR062,8,1*37", "$PQTMCFGSVIN,W,1,60,10,0,0,0*25", 
+        "$PAIR411,1*23", "$PAIR432,1*22", "$PAIR434,1*24", 
+        "$PAIR436,1*26", "$PQTMSAVEPAR*5A"
+    };
+
+    Serial.println("\n=== GNSS CONFIGURATION STARTING ===");
+    for (int i = 0; i < (sizeof(initCommands) / sizeof(initCommands[0])); i++) {
+        sendGnssCommand(initCommands[i], 1000); 
+    }
+    Serial.println("=== GNSS CONFIGURATION COMPLETED ===\n");
 }

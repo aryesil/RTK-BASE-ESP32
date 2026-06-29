@@ -6,3 +6,4 @@ void cleanOldSatellites();
 bool isChecksumValid(const char* sentence);
 void uyduTipleriniAyristir(const char* nmea);
 bool sendGnssCommand(const char* cmd, unsigned long timeoutMs = 1000);
+void applyGnssConfiguration();

@@ -1,6 +1,9 @@
 #include <network/NetworkManager.h>
 #include <Globals.h>
 #include <ArduinoOTA.h>
+#include <web/WebServerManager.h>
+
+extern void networkTaskCode(void * parameter);
 
 void setupNetwork() {
   prefs.begin("wifi_creds", false);
@@ -83,5 +86,22 @@ void handleNetworkState(uint32_t now) {
           WiFi.softAP("ESP32_RTK_BASE");
           currentNetState = NET_AP;
       }
+  }
+}
+void networkTaskCode(void * parameter) {
+  for(;;) {
+    uint32_t c0TaskStart = micros();
+    uint32_t now = millis();
+
+    handleNetworkState(now);
+    handleWebSocketQueue();
+    handleTelemetry(now);
+    
+    uint32_t c0TaskEnd = micros();
+    if (c0TaskEnd >= c0TaskStart) {
+        core0BusyTimeAcc += (c0TaskEnd - c0TaskStart);
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(20)); 
   }
 }
