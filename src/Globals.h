@@ -8,7 +8,7 @@
 #include <TinyGPS++.h>
 #include <Preferences.h>
 #include <ArduinoOTA.h>
-#include "Config.h"
+#include <Config.h>
 
 // ==========================================
 // AĞ DURUMLARI
