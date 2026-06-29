@@ -1,5 +1,5 @@
 #pragma once
-#include "Globals.h"
+#include <Globals.h>
 
 void addSat(const char* sys, int id, int elev, int azim, int snr, int sig);
 void cleanOldSatellites();

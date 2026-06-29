@@ -1,4 +1,4 @@
-#include "GNSS_Core.h"
+#include <gnss/GNSS_Core.h>
 
 void addSat(const char* sys, int id, int elev, int azim, int snr, int sig) {
   if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {

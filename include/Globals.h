@@ -7,7 +7,6 @@
 #include <ArduinoJson.h>
 #include <TinyGPS++.h>
 #include <Preferences.h>
-#include <ArduinoOTA.h>
 #include <Config.h>
 
 // ==========================================
@@ -22,7 +21,7 @@ extern Preferences prefs;
 extern bool newCredentialsReceived;
 
 // ==========================================
-// NESNELER VE DONANIM
+// OBJECTS AND HARDWARE
 // ==========================================
 extern AsyncWebServer server;
 extern AsyncWebSocket ws;
@@ -40,7 +39,7 @@ extern QueueHandle_t termQueue;
 extern portMUX_TYPE ppsMux; 
 
 // ==========================================
-// VERİ YAPILARI
+// DATA STRUCTURES
 // ==========================================
 struct SatData {
   int id;
@@ -68,6 +67,7 @@ extern volatile uint32_t sonPpsZamaniMicros;
 extern uint8_t globalFixQuality; 
 
 // Counters for Core CPU Load Tracking
+extern uint32_t core0BusyTimeAcc;
 extern uint32_t core1BusyTime; 
 
 extern char nmeaBuff[MAX_NMEA];
