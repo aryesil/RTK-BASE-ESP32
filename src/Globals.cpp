@@ -1,6 +1,5 @@
 #include <Globals.h>
 
-// Değişkenleri burada GERÇEK OLARAK tanımlıyoruz
 NetState currentNetState = NET_AP;
 uint32_t netStateTimer = 0;
 String targetSSID = "";
