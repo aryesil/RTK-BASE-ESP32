@@ -21,7 +21,7 @@ Waveshare LC29H or RTK capable GNSS Module with NMEA and RTCM output
 <h2>Wiring / Circuit Setup</h2>
 <img width="616" height="810" alt="ESP32-RTK-DIAGRAM" src="https://github.com/user-attachments/assets/40c695e6-1b1a-47fd-8738-563983d75720" />
 
-Handled by the user. Key conenctions:
+Handled by the user. Key connections:
 <h3>GNSS TX => ESP32 RXD2 (GPIO16)</h3>
 <h3>GNSS RX <= ESP32 TXD2 (GPIO 17)</h3>
 <h3>GNSS PPS => ESP32 (GPIO 27)</h3>
