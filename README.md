@@ -43,7 +43,7 @@ Handled by the user. Key connections:
 
 ```text
 git clone https://github.com/aryesil/RTK-BASE-ESP32
-cd esp32-rtk-base
+cd RTK-BASE-ESP32
 ```
 <h3>2) Install PlatformIO</h3> (if not already installed):
 Via VS Code: Install the "PlatformIO IDE" extension.
