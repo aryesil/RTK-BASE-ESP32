@@ -40,9 +40,9 @@ Handled by the user. Key connections:
 
 <h2>Installation Steps:</h2>
 <h3>1) Clone the repository</h3>
-git clone https://github.com/aryesil/RTK-BASE-ESP32
 
 ```text
+git clone https://github.com/aryesil/RTK-BASE-ESP32
 cd esp32-rtk-base
 ```
 <h3>2) Install PlatformIO</h3> (if not already installed):
