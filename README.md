@@ -138,7 +138,7 @@ These are designed for Quectel LC29H(BS) module. If your GNSS receiver uses a di
 | `RTCM_PORT` | `2101`   | TCP listening port for RTCM stream |
 
 <h2>Other Defaults</h2>
-<h3>Max TCP clients:</h3> 3 (defined in src/Globals.cpp
+<h3>Max TCP clients:</h3> 3 (defined in src/Globals.cpp)
 <h3>Max tracked satellites:</h3> 150 (MAX_SATS in Config.h)
 <h3>NMEA buffer size:</h3> 256 chars (MAX_NMEA in Config.h)
 <h3>Serial2 RX buffer:</h3> 2048 bytes (set at runtime in setupGNSS())
