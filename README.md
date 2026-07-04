@@ -1,8 +1,7 @@
 <h1>ESP32-RTK-BASE</h1>
-ESP32-based RTK (Real-Time Kinematic) base station for GNSS correction data streaming over TCP.
-
 <img width="1280" height="640" alt="SocialPreview_1280x640" src="https://github.com/user-attachments/assets/ef8c9422-578a-4bda-a306-e1ea4433e289" />
 
+ESP32-based RTK (Real-Time Kinematic) base station for GNSS correction data streaming over TCP.
 
 <h2>Overview</h2>
 This project turns an ESP32 into a networked RTK base station that receives RTCM3 and NMEA messages from a multi-constellation GNSS receiver, parses satellite tracking data, and broadcasts raw RTCM streams to up to 3 connected rovers over TCP port 2101. A web interface provides real-time telemetry (position, fix quality, sky view, CPU load) via WebSocket, and the device manages its own WiFi connection with automatic AP fallback for recovery.
