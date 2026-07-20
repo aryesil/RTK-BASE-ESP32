@@ -185,7 +185,7 @@ Sky view data (system, PRN, elevation, azimuth, SNR for primary-band satellites)
 - Terminal
 
 <h2>GNSS Command via Web UI</h2>
-Send custom NMEA or Quectel bianry commands to the GNSS module through WebUI terminal, checksum will be automatically added to the end of command.
+Send custom NMEA or Quectel binary commands to the GNSS module through WebUI terminal, checksum will be automatically added to the end of command.
 
 <h2>WebUI Telemetry Screen</h2>
 
