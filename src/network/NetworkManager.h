@@ -5,3 +5,7 @@ void setupNetwork();
 void handleNetworkState(uint32_t now);
 
 void networkTaskCode(void * parameter);
+
+void loadApConfig();
+void saveApConfig();
+void restartAccessPoint();

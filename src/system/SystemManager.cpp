@@ -10,7 +10,8 @@ void initHardware() {
 void initSystemResources() {
     dataMutex = xSemaphoreCreateMutex();
     tcpMutex = xSemaphoreCreateMutex();
-    termQueue = xQueueCreate(15, sizeof(char) * 160);
+    baseMutex = xSemaphoreCreateMutex();
+    termQueue = xQueueCreate(15, TERM_MSG_LEN);
 }
 
 void IRAM_ATTR ppsKesmesi() {
