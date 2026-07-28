@@ -310,6 +310,11 @@ Measured on an ESP32-WROOM-32D tracking 39 satellites: **2 % load on each core**
 <h3>GLONASS is single-frequency</h3>  On this module it contributes no ionospheric measurements.
 <h3>Consumer limits</h3>  Six simultaneous TCP/NTRIP consumers and six UDP subscribers; beyond that the caster answers `503`.
 
+<h2>Acknowledgements</h2>
+
+Parts of the interface layout were inspired by conventions used in Septentrio
+receiver web interfaces.
+
 ## License
 
 This project is licensed under the MIT License.
