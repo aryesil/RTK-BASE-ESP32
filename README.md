@@ -79,7 +79,7 @@ Quality indicators, the constellation fan with a live downlink animation, correc
 
 ![Position, ionosphere and scatter](docs/img/overview-position.png)
 
-The position scatter shows horizontal deviation from the running mean in centimetres. During survey-in the cloud should shrink and stay centred; a drifting cloud means the antenna or the multipath environment is not stable yet.
+The position scatter shows horizontal deviation from the running mean in centimetres. During survey-in the cloud should shrink and stay centred; a drifting cloud means the antenna or the multipath environment is not stable yet. A red cross marks the coordinate actually being broadcast in RTCM 1005, so a station coordinate that is simply wrong shows up here rather than hiding behind a self-centred plot.
 
 <h3>GNSS</h3>
 

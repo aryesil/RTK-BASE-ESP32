@@ -150,7 +150,7 @@ code{background:#f2f5f8;padding:1px 5px;border-radius:3px;font-size:12px}
       <h4>Position</h4>
       <div class="hbox"><b>Lat</b><span id="hLat">--</span></div>
       <div class="hbox"><b>Lon</b><span id="hLon">--</span></div>
-      <div class="hbox"><b>Hgt</b><span id="hHgt">--</span></div>
+      <div class="hbox"><b>Hgt (MSL)</b><span id="hHgt">--</span></div>
     </div>
     <div class="hgroup">
       <h4>Status</h4>
@@ -224,8 +224,9 @@ code{background:#f2f5f8;padding:1px 5px;border-radius:3px;font-size:12px}
       <div class="kv">
         <b>Latitude</b><span id="oLat">--</span>
         <b>Longitude</b><span id="oLon">--</span>
-        <b>Ellipsoidal height</b><span id="oHgt">--</span>
+        <b>Height above MSL</b><span id="oHgt">--</span>
         <b>Geoid separation</b><span id="oSep">--</span>
+        <b>Ellipsoidal height</b><span id="oHgtE">--</span>
         <b>Position mode</b><span id="oMode">--</span>
         <b>Satellites in use</b><span id="oSiu">--</span>
         <b>PDOP / HDOP / VDOP</b><span id="oDop">-- / -- / --</span>
@@ -268,11 +269,17 @@ code{background:#f2f5f8;padding:1px 5px;border-radius:3px;font-size:12px}
         <b>Spread (2D RMS)</b><span id="scRms">--</span>
         <b>Peak-to-peak E / N</b><span id="scPp">--</span>
         <b>Height spread</b><span id="scH">--</span>
+        <b>Offset from broadcast</b><span id="scBc">--</span>
       </div>
       <div class="note">
-        Horizontal deviation from the running mean, in centimetres. During
-        survey-in the cloud should shrink and stay centred; a drifting cloud
-        means the antenna or the multipath environment is not stable yet.
+        Horizontal deviation of the receiver's own solution from its running
+        mean, in centimetres. During survey-in the cloud should shrink and stay
+        centred; a drifting cloud means the antenna or the multipath environment
+        is not stable yet.<br><br>
+        The red cross marks the coordinate being broadcast in RTCM 1005, or an
+        arrow points to it when it falls outside the plot. A few metres is
+        normal, since the receiver's own solution is only DGNSS-accurate; tens
+        of metres means the station coordinate itself is wrong.
       </div>
     </div>
   </div>
@@ -836,6 +843,9 @@ const SVIN_V  = ['Invalid','In progress','Valid'];
 const JAM_TXT = ['unknown','clean','warning','critical'];
 
 let D = null, page = 'overview';
+// The device sends the satellite and ionosphere arrays every other tick to keep
+// frames small; carry the last ones forward on the ticks that omit them.
+let lastSig = [], lastIo = [], lastRx = 0, staleTimer = null;
 let baseFormLoaded = false, outFormLoaded = false, netFormLoaded = false, termLines = [];
 let scatter = [];   // {e, n, h} in metres relative to the running mean
 
@@ -898,6 +908,18 @@ function initWs(){
     setTimeout(initWs, 2000);
   };
   sock.onmessage = onMessage;
+
+  // A late frame is a lost WiFi packet being retransmitted, not a dead device.
+  // Saying so beats a page that silently stops changing.
+  if(staleTimer) clearInterval(staleTimer);
+  staleTimer = setInterval(() => {
+    if(!lastRx || sock.readyState !== 1) return;
+    const age = (Date.now() - lastRx) / 1000;
+    if(age > 2.5){
+      $('link').innerHTML = '&#9679; link slow, ' + age.toFixed(0) + ' s';
+      $('link').style.color = '#b8860b';
+    }
+  }, 500);
 }
 function onMessage(ev){
   const s = ev.data;
@@ -909,7 +931,14 @@ function onMessage(ev){
   }
   if(s.startsWith('TERM:')){ log('rx', s.slice(5)); return; }
   if(s.startsWith('TXCMD:')){ log('tx', s.slice(6)); return; }
-  try { D = JSON.parse(s); } catch(e){ return; }
+  let n;
+  try { n = JSON.parse(s); } catch(e){ return; }
+  if(n.sig) lastSig = n.sig; else n.sig = lastSig;
+  if(n.io)  lastIo  = n.io;  else n.io  = lastIo;
+  D = n;
+  lastRx = Date.now();
+  $('link').innerHTML = '&#9679; connected';
+  $('link').style.color = '#2e7d32';
   render();
 }
 
@@ -1065,11 +1094,24 @@ function renderOverview(){
   txt('oEph', D.base.eph === 1 ? 'Enabled' : D.base.eph === 0 ? 'Disabled' : 'Unknown');
   txt('oTcp', D.tcp);
 
-  if(D.base.m === 1 && D.base.dur > 0){
+  const sv = D.svin;
+  if(surveyRunning() && D.base.dur > 0){
     $('oSvin').style.display = 'block';
-    const pct = Math.min(100, D.base.el / D.base.dur * 100);
-    $('oSvinBar').style.width = pct.toFixed(1) + '%';
-    txt('oSvinTxt', `Survey-in running: ${dur(D.base.el)} of ${dur(D.base.dur)} minimum, target accuracy ${D.base.acc} m.`);
+    // Prefer the receiver's own observation count over the ESP-side timer, so
+    // this panel and the Base Mode page never disagree.
+    const live = sv.feat === 1 && sv.dur > 0;
+    $('oSvinBar').style.width =
+      Math.min(100, (live ? sv.obs / sv.dur : D.base.el / D.base.dur) * 100).toFixed(1) + '%';
+    txt('oSvinTxt', live
+      ? `Survey-in running: ${sv.obs} of ${sv.dur} observations, mean accuracy ${sv.acc.toFixed(2)} m.`
+      : `Survey-in running: ${dur(D.base.el)} of ${dur(D.base.dur)} minimum, target accuracy ${D.base.acc} m.`);
+  } else if(D.base.m === 1){
+    $('oSvin').style.display = 'block';
+    $('oSvinBar').style.width = '100%';
+    txt('oSvinTxt', 'Survey-in complete \u2014 the receiver is broadcasting the surveyed ' +
+      'position. Its configured mode is still survey-in, so a power cycle starts the ' +
+      'averaging again. Use "Adopt result as fixed position" on the Base Mode page, then ' +
+      'Save, to make it permanent.');
   } else {
     $('oSvin').style.display = 'none';
   }
@@ -1078,6 +1120,11 @@ function renderOverview(){
   txt('oLon', D.vloc ? D.lon.toFixed(8) + '°' : '--');
   txt('oHgt', D.valt ? D.alt.toFixed(3) + ' m' : '--');
   txt('oSep', D.sep ? D.sep.toFixed(3) + ' m' : '--');
+  // GGA reports height above mean sea level; the ellipsoidal height that base
+  // coordinates are expressed in is that plus the geoid separation. Labelling
+  // the MSL value "ellipsoidal" would invite a ~36 m error when someone copies
+  // it into the fixed-mode form.
+  txt('oHgtE', D.valt ? (D.alt + (D.sep || 0)).toFixed(3) + ' m' : '--');
   txt('oMode', (D.ft === 3 ? '3D' : D.ft === 2 ? '2D' : 'No fix') + ' – ' + (FIXQ[D.fq] || 'Invalid'));
   txt('oSiu', D.siu + ' (GGA) / ' + usedTotal() + ' (GSA)');
   txt('oDop', [D.pdop, D.hdop, D.vdop].map(v => v ? v.toFixed(2) : '--').join(' / '));
@@ -1356,17 +1403,28 @@ function buildSatTable(){
 // The module leaves its configured mode at "survey-in" even after the survey
 // finishes and it starts transmitting the surveyed coordinates. Operating state
 // is therefore derived from what is on the wire, not from the configuration.
-function operatingState(){
+// Single source of truth for "is a survey actually in progress". Configured
+// mode alone is not enough: the module finishes the survey and starts
+// broadcasting the surveyed coordinates without ever rewriting its
+// configuration, so anything keyed on base.m alone claims it is still
+// surveying forever.
+function surveyRunning(){
   const b = D.base, sv = D.svin, bc = D.bc;
+  if(b.m !== 1) return false;
+  // $PQTMSVINSTATUS is authoritative when the firmware provides it.
+  if(sv.feat === 1) return sv.v !== 2;
+  // Otherwise infer it: 1005 is emitted throughout the survey, so only a
+  // coordinate that has stopped changing means the survey has settled.
+  return !(bc.v && bc.age >= 0 && bc.age < 30 && bc.st > 30);
+}
+
+function operatingState(){
+  const b = D.base, bc = D.bc;
   if(b.m === 2) return 'Fixed';
   if(b.m === 1){
-    // $PQTMSVINSTATUS is authoritative when the firmware provides it.
-    if(sv.feat === 1) return sv.v === 2 ? 'Fixed (survey-in complete)' : 'Survey-In running';
-    // Otherwise infer it: 1005 is emitted throughout the survey, so only a
-    // coordinate that has stopped changing means the survey has settled.
-    if(bc.v && bc.age >= 0 && bc.age < 30 && bc.st > 30)
-      return 'Fixed (station position settled)';
-    return 'Survey-In running';
+    if(surveyRunning()) return 'Survey-In running';
+    return D.svin.feat === 1 ? 'Fixed (survey-in complete)'
+                             : 'Fixed (station position settled)';
   }
   if(b.m === 0) return bc.v ? 'Broadcasting, mode disabled' : 'Disabled';
   return 'Unknown';
@@ -1628,6 +1686,43 @@ function drawScatter(){
   });
   ctx.strokeStyle = '#ef9421'; ctx.lineWidth = 2;
   ctx.beginPath(); ctx.arc(cx, cy, 5, 0, 2*Math.PI); ctx.stroke();
+
+  // Where the broadcast coordinate sits relative to this cloud. The cloud is
+  // deliberately still centred on its own mean, because that is what keeps the
+  // noise legible; this marker is what reveals a station coordinate that is
+  // simply wrong, which a self-referenced plot can never show.
+  let bcTxt = '--';
+  const bc = D.bc;
+  if(bc && bc.v && scRef){
+    const mLon = 111320 * Math.cos(scRef.lat * Math.PI / 180);
+    const bcE = (bc.lon - scRef.lon) * mLon - me;
+    const bcN = (bc.lat - scRef.lat) * 111320 - mn;
+    const dist = Math.hypot(bcE, bcN);
+    bcTxt = dist < 1 ? (dist * 100).toFixed(1) + ' cm' : dist.toFixed(2) + ' m';
+
+    const bx = cx + bcE * sc, by = cy - bcN * sc;
+    if(dist <= span){
+      ctx.strokeStyle = '#c0392b'; ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      ctx.moveTo(bx - 6, by); ctx.lineTo(bx + 6, by);
+      ctx.moveTo(bx, by - 6); ctx.lineTo(bx, by + 6);
+      ctx.stroke();
+    } else {
+      // Off the plotted area: point at it from the rim so a gross coordinate
+      // error is still obvious instead of silently invisible.
+      const ang = Math.atan2(-bcN, bcE);
+      const rx = cx + Math.cos(ang) * (cx - 26), ry = cy + Math.sin(ang) * (cx - 26);
+      ctx.fillStyle = '#c0392b';
+      ctx.beginPath();
+      ctx.moveTo(rx + Math.cos(ang) * 7, ry + Math.sin(ang) * 7);
+      ctx.lineTo(rx + Math.cos(ang + 2.5) * 7, ry + Math.sin(ang + 2.5) * 7);
+      ctx.lineTo(rx + Math.cos(ang - 2.5) * 7, ry + Math.sin(ang - 2.5) * 7);
+      ctx.closePath(); ctx.fill();
+      ctx.font = '9px Arial'; ctx.textAlign = 'center';
+      ctx.fillText(bcTxt, rx - Math.cos(ang) * 14, ry - Math.sin(ang) * 14 + 3);
+    }
+  }
+  txt('scBc', bcTxt);
 
   const rms = Math.sqrt(scatter.reduce((a, p) =>
     a + (p.e - me) ** 2 + (p.n - mn) ** 2, 0) / scatter.length);

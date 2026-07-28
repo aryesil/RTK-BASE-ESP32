@@ -45,6 +45,13 @@ static char expectedAuth[80];
 // --------------------------------------------------------------------------
 // config
 // --------------------------------------------------------------------------
+// Parse the destination once, here, instead of on every outgoing frame.
+static void resolveUdpDest() {
+  IPAddress a;
+  outCfg.udpDestAddr = (outCfg.udpDest[0] && a.fromString(outCfg.udpDest))
+                       ? (uint32_t)a : 0;
+}
+
 static void rebuildExpectedAuth() {
   expectedAuth[0] = '\0';
   if (outCfg.ntripUser[0] == '\0' && outCfg.ntripPass[0] == '\0') return;
@@ -75,6 +82,7 @@ void loadOutputCfg() {
   strlcpy(outCfg.ntripUser, outPrefs.getString("user", "").c_str(), sizeof(outCfg.ntripUser));
   strlcpy(outCfg.ntripPass, outPrefs.getString("pass", "").c_str(), sizeof(outCfg.ntripPass));
   rebuildExpectedAuth();
+  resolveUdpDest();
 }
 
 void saveOutputCfg() {
@@ -90,6 +98,7 @@ void saveOutputCfg() {
   outPrefs.putString("user", outCfg.ntripUser);
   outPrefs.putString("pass", outCfg.ntripPass);
   rebuildExpectedAuth();
+  resolveUdpDest();
 }
 
 // --------------------------------------------------------------------------
@@ -499,11 +508,9 @@ void sendRtcmFrame(const uint8_t* frame, size_t len, uint16_t msgType) {
     if (udpSock >= 0) {
       // Every datagram leaves from the bound port, so a receiver that connected
       // to <device>:<udpPort> accepts it.
-      if (outCfg.udpDest[0] && outCfg.udpDestPort) {
-        IPAddress dst;
-        if (dst.fromString(outCfg.udpDest))
-          udpSendTo(dst, outCfg.udpDestPort, frame, len);
-      }
+      uint32_t dst = outCfg.udpDestAddr;      // single aligned read
+      if (dst && outCfg.udpDestPort)
+        udpSendTo(IPAddress(dst), outCfg.udpDestPort, frame, len);
 
       if (outCfg.udpBroadcast) {
         // One datagram per interface: the rover may be on the soft-AP while a

@@ -101,9 +101,23 @@ void handleNtripPush() {
       break;
 
     case PUSH_CONNECTING: {
+      // Copy the settings before the blocking call: a web request may rewrite
+      // them from another task at any moment, and connect() holds no lock.
+      char host[sizeof(pushCfg.host)], mount[sizeof(pushCfg.mount)], pw[sizeof(pushCfg.pass)];
+      uint16_t port;
+      if (xSemaphoreTake(baseMutex, portMAX_DELAY)) {
+        strlcpy(host, pushCfg.host, sizeof(host));
+        strlcpy(mount, pushCfg.mount, sizeof(mount));
+        strlcpy(pw, pushCfg.pass, sizeof(pw));
+        port = pushCfg.port;
+        xSemaphoreGive(baseMutex);
+      } else {
+        return;
+      }
+
       // Blocking, which is why this runs on the network task and not on the
       // core that forwards RTCM.
-      if (!pending.connect(pushCfg.host, pushCfg.port, 5000)) {
+      if (!pending.connect(host, port, 5000)) {
         dropAndBackoff("Connection refused or host unreachable");
         return;
       }
@@ -114,7 +128,7 @@ void handleNtripPush() {
                        "SOURCE %s /%s\r\n"
                        "Source-Agent: NTRIP ESP32-RTK-Base/" FW_VERSION "\r\n"
                        "STR: \r\n\r\n",
-                       pushCfg.pass, pushCfg.mount);
+                       pw, mount);
       pending.write((const uint8_t*)req, n);
       rxLen = 0;
       setState(PUSH_HANDSHAKE, "Waiting for caster response");
@@ -135,8 +149,11 @@ void handleNtripPush() {
         pushState.sent = 0;
         backoffMs = 5000;
         setState(PUSH_STREAMING, "Streaming");
-        Serial.printf("[NTRIP] Pushing to %s:%u/%s\n",
-                      pushCfg.host, pushCfg.port, pushCfg.mount);
+        if (xSemaphoreTake(baseMutex, portMAX_DELAY)) {
+          Serial.printf("[NTRIP] Pushing to %s:%u/%s\n",
+                        pushCfg.host, pushCfg.port, pushCfg.mount);
+          xSemaphoreGive(baseMutex);
+        }
         return;
       }
       if (rxLen && (strstr(rxBuf, "ERROR") || strstr(rxBuf, "401") || strstr(rxBuf, "400"))) {

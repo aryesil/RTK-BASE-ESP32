@@ -181,6 +181,11 @@ struct OutputCfg {
   // datagram (Mission Planner and most autopilot GCS) is streamed to here.
   char     udpDest[16];
   uint16_t udpDestPort;
+  // Resolved once when the setting changes. The RTCM path runs on the other
+  // core and used to parse the string on every frame, while a web request
+  // could be rewriting it - a torn read waiting to happen, and needless work
+  // in the hot path besides.
+  uint32_t udpDestAddr;
   // Sends every frame to the subnet broadcast address as well, so a listener
   // bound to udpPort receives the stream without any handshake at all.
   bool     udpBroadcast;

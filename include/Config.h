@@ -57,4 +57,4 @@
 
 #define AP_SSID   "ESP32_RTK_BASE"
 #define RX_MODEL  "LC29H (BS)"
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "1.0.1"

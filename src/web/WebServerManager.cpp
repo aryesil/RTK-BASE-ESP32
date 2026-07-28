@@ -6,6 +6,7 @@
 #include <network/DataOutput.h>
 #include <network/NetworkManager.h>
 #include <network/NtripPush.h>
+#include <stdarg.h>
 #include <gnss/Iono.h>
 
 // Escapes a string for embedding in a JSON string literal. SSIDs are arbitrary
@@ -41,6 +42,86 @@ static void sendProgmemPage(AsyncWebServerRequest *request, const char* page) {
   request->send(request->beginResponse(200, "text/html",
                                        (const uint8_t*)page, strlen_P(page)));
 }
+
+
+namespace {
+// Scope guard mirroring the one in BaseConfig.cpp, for the config structs the
+// web handlers share with the network task.
+struct BaseLockWeb {
+  BaseLockWeb()  { xSemaphoreTake(baseMutex, portMAX_DELAY); }
+  ~BaseLockWeb() { xSemaphoreGive(baseMutex); }
+};
+}
+
+// --------------------------------------------------------------------------
+// Telemetry serialisation
+//
+// Written straight into a static buffer rather than through a JsonDocument.
+// ArduinoJson 7 releases its whole pool on clear(), so building this document
+// once a second meant hundreds of allocate/free cycles and about 9 kB of heap
+// churn every second, on a device expected to run for days.
+// --------------------------------------------------------------------------
+namespace {
+
+struct JBuf {
+  char*  b;
+  size_t cap;
+  size_t n = 0;
+  bool   first = true;   // no comma before the first member of the current level
+
+  JBuf(char* buf, size_t c) : b(buf), cap(c) {}
+
+  void put(char c) { if (n + 1 < cap) b[n++] = c; }
+  void raw(const char* s) { while (*s && n + 1 < cap) b[n++] = *s++; }
+
+  void fmt(const char* f, ...) {
+    if (n + 1 >= cap) return;
+    va_list ap;
+    va_start(ap, f);
+    int w = vsnprintf(b + n, cap - n, f, ap);
+    va_end(ap);
+    if (w > 0) n += (size_t)w < cap - n ? (size_t)w : cap - n - 1;
+  }
+
+  // Only the few operator-supplied strings can contain anything awkward, but
+  // escaping every string keeps one rule instead of two.
+  void str(const char* s) {
+    put('"');
+    for (; *s && n + 7 < cap; s++) {
+      unsigned char c = (unsigned char)*s;
+      if (c == '"' || c == '\\') { put('\\'); put((char)c); }
+      else if (c == '\n') raw("\\n");
+      else if (c == '\r') raw("\\r");
+      else if (c == '\t') raw("\\t");
+      else if (c < 0x20) fmt("\\u%04X", c);
+      else put((char)c);
+    }
+    put('"');
+  }
+
+  void comma() { if (!first) put(','); first = false; }
+  void key(const char* k) { comma(); str(k); put(':'); }
+
+  void obj(const char* k) { key(k); put('{'); first = true; }
+  void arr(const char* k) { key(k); put('['); first = true; }
+  void end(char c) { put(c); first = false; }
+
+  void kv(const char* k, double v, int dp) { key(k); fmt("%.*f", dp, v); }
+  void kv(const char* k, long v)           { key(k); fmt("%ld", v); }
+  void kv(const char* k, unsigned long v)  { key(k); fmt("%lu", v); }
+  void kv(const char* k, int v)            { key(k); fmt("%d", v); }
+  void kv(const char* k, bool v)           { key(k); raw(v ? "true" : "false"); }
+  void kv(const char* k, const char* v)    { key(k); str(v); }
+
+  // Elements of an array: same rules without a key.
+  void el(long v)          { comma(); fmt("%ld", v); }
+  void el(int v)           { comma(); fmt("%d", v); }
+  void el(unsigned long v) { comma(); fmt("%lu", v); }
+  void el(double v, int dp){ comma(); fmt("%.*f", dp, v); }
+  void el(const char* v)   { comma(); str(v); }
+};
+
+}  // namespace
 
 void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
   if (type == WS_EVT_DATA) {
@@ -123,9 +204,14 @@ static void handleBaseApi(AsyncWebServerRequest *request) {
   // Distinct from action=arp above, which toggles RTCM 1005 output: this is the
   // geometric offset from the surveyed ground marker to the antenna.
   if (action == "arpoffset") {
-    if (request->hasParam("n")) arpCfg.north = request->getParam("n")->value().toFloat();
-    if (request->hasParam("e")) arpCfg.east  = request->getParam("e")->value().toFloat();
-    if (request->hasParam("u")) arpCfg.up    = request->getParam("u")->value().toFloat();
+    // Read by the telemetry builder on the other task; keep the three
+    // components consistent with each other.
+    if (xSemaphoreTake(baseMutex, portMAX_DELAY)) {
+      if (request->hasParam("n")) arpCfg.north = request->getParam("n")->value().toFloat();
+      if (request->hasParam("e")) arpCfg.east  = request->getParam("e")->value().toFloat();
+      if (request->hasParam("u")) arpCfg.up    = request->getParam("u")->value().toFloat();
+      xSemaphoreGive(baseMutex);
+    }
     saveArpCfg();
     request->send(200, "application/json", "{\"ok\":true}");
     return;
@@ -284,6 +370,7 @@ static void handleNetApi(AsyncWebServerRequest *request) {
 }
 
 static void handlePushApi(AsyncWebServerRequest *request) {
+  BaseLockWeb lock;   // the network task reads these while connecting
   if (request->hasParam("en")) pushCfg.enabled = request->getParam("en")->value().toInt() != 0;
   if (request->hasParam("host")) {
     String h = request->getParam("host")->value();
@@ -459,6 +546,18 @@ void handleTelemetry(uint32_t now) {
   lastCpuCheckTime = now;
   if (ws.count() == 0) return;
 
+  // AsyncWebSocket discards a message outright when a client's queue is full,
+  // which the page sees as a freeze with no explanation. Check first, skip
+  // deliberately and count it, so a backed-up link is visible instead of
+  // silently eating updates. Building the document is the expensive part, so
+  // this also saves the work.
+  static uint32_t telemSeq = 0, telemSkipped = 0;
+  telemSeq++;
+  if (!ws.availableForWriteAll()) {
+    telemSkipped++;
+    return;
+  }
+
   // ---- snapshot ---------------------------------------------------------
   int sigCount = 0;
   GpsSnapshot g;
@@ -512,75 +611,12 @@ void handleTelemetry(uint32_t now) {
   }
 
   // ---- serialise --------------------------------------------------------
-  static JsonDocument doc;
-  doc.clear();
-
-  doc["up"]   = millis() / 1000;
-  doc["ip"]   = WiFi.localIP().toString();
-  doc["ap"]   = WiFi.softAPIP().toString();
-  doc["ssid"] = WiFi.SSID();
-  doc["rssi"] = WiFi.RSSI();
-  doc["net"]  = (int)currentNetState;
-  doc["heap"] = ESP.getFreeHeap();
-  doc["model"] = RX_MODEL;
-  doc["esp"]  = FW_VERSION;
-
-  doc["lat"]  = g.validLoc ? g.lat : 0.0;
-  doc["lon"]  = g.validLoc ? g.lon : 0.0;
-  doc["alt"]  = g.validAlt ? g.alt : 0.0;
-  doc["sep"]  = g.geoidSep;
-  doc["vloc"] = g.validLoc;
-  doc["valt"] = g.validAlt;
-  doc["hdop"] = g.validHdop ? g.hdop : 0.0;
-  doc["pdop"] = g.pdop;
-  doc["vdop"] = g.vdop;
-  doc["fq"]   = g.fixQual;
-  doc["ft"]   = g.fixType;
-  doc["siu"]  = g.satsInUse;
-
-  char timeStr[12] = "--:--:--";
-  if (g.validTime) snprintf(timeStr, sizeof(timeStr), "%02u:%02u:%02u", g.hour, g.min, g.sec);
-  doc["time"] = timeStr;
-
-  doc["pps"]  = (micros() - lastPps < 2000000);
-  doc["rtcm"] = currentRtcmCount;
-  doc["tcp"]  = activeTcp;
-  doc["udp"]  = activeUdp;
-  doc["cpu0"] = cpu0Usage;
-  doc["cpu1"] = cpu1Usage;
-
-  JsonObject ap = doc["apinfo"].to<JsonObject>();
-  ap["ssid"] = apCfg.ssid;
-  ap["ch"]   = apCfg.channel;
-  ap["sec"]  = strlen(apCfg.pass) >= 8;
-  ap["hide"] = apCfg.hidden;
-  ap["n"]    = WiFi.softAPgetStationNum();
-
-  JsonObject o = doc["out"].to<JsonObject>();
-  o["tcpEn"]   = outCfg.tcpEnabled;
-  o["tcpPort"] = outCfg.tcpPort;
-  o["accept"]  = outCfg.acceptMode;
-  o["udpEn"]   = outCfg.udpEnabled;
-  o["udpPort"] = outCfg.udpPort;
-  o["udpDst"]  = outCfg.udpDest;
-  o["udpDstP"] = outCfg.udpDestPort;
-  o["udpBc"]   = outCfg.udpBroadcast;
-  o["udpRx"]   = udpRxCount;
-  o["udpFrom"] = udpLastFrom;
-  o["udpAge"]  = udpLastRxMs ? (int32_t)((millis() - udpLastRxMs) / 1000) : -1;
-  o["mount"]   = outCfg.mount;
-  o["user"]    = outCfg.ntripUser;
-  o["auth"]    = (outCfg.ntripUser[0] || outCfg.ntripPass[0]);
-
-  // Optional module features and the ESP-side helpers that back them up.
-  SvinStatus sv;
-  JamStatus jm;
-  PosAvg pa;
+  // Snapshots first, so no lock is held while formatting.
+  SvinStatus sv; JamStatus jm; PosAvg pa;
   if (xSemaphoreTake(baseMutex, portMAX_DELAY)) {
     sv = svin; jm = jam; pa = posAvg;
     xSemaphoreGive(baseMutex);
   }
-
   BaseBroadcast bc;
   if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
     bc = bcast;
@@ -588,169 +624,253 @@ void handleTelemetry(uint32_t now) {
   }
   ionoUpdate(g.validLoc ? g.lat : 0.0, g.validLoc ? g.lon : 0.0, g.validLoc);
 
-  // [sysIdx, prn, elev, azim, rawSlant*100, deltaVert*100, arcSeconds,
-  //  ippLat, ippLon]
-  JsonArray io = doc["io"].to<JsonArray>();
-  int ionoUsable = 0;
+  static IonoSat ionoLocal[MAX_IONO_SATS];
+  int ionoN = 0, ionoUsable = 0;
   float dSum = 0;
   if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
-    for (int i = 0; i < ionoSatCount; i++) {
-      const IonoSat &s = ionoSats[i];
-      JsonArray e = io.add<JsonArray>();
-      e.add(s.sys);
-      e.add(s.prn);
-      e.add(s.elev);
-      e.add(s.azim);
-      e.add((int)lroundf(s.slantRaw * 100));
-      e.add((int)lroundf(s.vertDelta * 100));
-      e.add(s.hasRef ? (millis() - s.arcStartMs) / 1000 : 0);
-      e.add(s.ippLat);
-      e.add(s.ippLon);
-      if (s.elev > 0 && s.hasRef) { ionoUsable++; dSum += fabsf(s.vertDelta); }
-    }
+    ionoN = ionoSatCount;
+    memcpy(ionoLocal, ionoSats, ionoN * sizeof(IonoSat));
     xSemaphoreGive(dataMutex);
   }
-  doc["ion"] = ionoUsable;
-  doc["iond"] = ionoUsable ? dSum / ionoUsable : 0.0f;
+  for (int i = 0; i < ionoN; i++)
+    if (ionoLocal[i].elev > 0 && ionoLocal[i].hasRef) {
+      ionoUsable++; dSum += fabsf(ionoLocal[i].vertDelta);
+    }
 
-  JsonObject bj = doc["bc"].to<JsonObject>();
-  bj["v"]   = bc.valid;
-  bj["id"]  = bc.stationId;
-  bj["x"]   = bc.x;
-  bj["y"]   = bc.y;
-  bj["z"]   = bc.z;
-  bj["age"] = bc.lastMs ? (int32_t)((millis() - bc.lastMs) / 1000) : -1;
-  bj["st"]  = bc.stableSince ? (millis() - bc.stableSince) / 1000 : 0;
-  if (bc.valid) {
-    double la, lo, hg;
-    ecefToLla(bc.x, bc.y, bc.z, la, lo, hg);
-    bj["lat"] = la; bj["lon"] = lo; bj["hgt"] = hg;
-  }
-
-  JsonObject sj = doc["svin"].to<JsonObject>();
-  sj["feat"] = sv.feat;
-  sj["v"]    = sv.valid;
-  sj["obs"]  = sv.obs;
-  sj["dur"]  = sv.cfgDur;
-  sj["acc"]  = sv.acc;
-  sj["x"]    = sv.x;
-  sj["y"]    = sv.y;
-  sj["z"]    = sv.z;
-
-  JsonObject jj = doc["jam"].to<JsonObject>();
-  jj["feat"] = jm.feat;
-  jj["l1"]   = jm.l1;
-  jj["l5"]   = jm.haveL5 ? jm.l5 : -1;
-
-  JsonObject aj = doc["arp"].to<JsonObject>();
-  aj["n"] = arpCfg.north;
-  aj["e"] = arpCfg.east;
-  aj["u"] = arpCfg.up;
-
-  JsonObject av = doc["avg"].to<JsonObject>();
-  av["run"]  = pa.running;
-  av["el"]   = pa.running ? (millis() - pa.startedMs) / 1000 : 0;
-  av["tgt"]  = pa.targetSec;
-  av["n"]    = pa.count;
-  av["have"] = pa.haveResult;
-  av["lat"]  = pa.lat;
-  av["lon"]  = pa.lon;
-  av["alt"]  = pa.alt;
-  av["rms"]  = pa.rms;
-
-  JsonObject pu = doc["push"].to<JsonObject>();
-  pu["en"]    = pushCfg.enabled;
-  pu["host"]  = pushCfg.host;
-  pu["port"]  = pushCfg.port;
-  pu["mount"] = pushCfg.mount;
-  pu["st"]    = pushState.state;
-  pu["msg"]   = pushState.msg;
-  pu["sent"]  = pushState.sent;
-  pu["retry"] = pushState.retries;
-  pu["up"]    = pushState.state == PUSH_STREAMING ? (millis() - pushState.sinceMs) / 1000 : 0;
-
-  JsonObject rs = doc["rst"].to<JsonObject>();
-  rs["f"]   = st.frames;
-  rs["crc"] = st.crcErrors;
-  rs["bps"] = st.bytesSec;
-  rs["age"] = st.lastFrameMs ? (millis() - st.lastFrameMs) / 1000 : -1;
-  JsonArray ty = rs["ty"].to<JsonArray>();
-  for (int i = 0; i < st.typeCount; i++) {
-    JsonArray e = ty.add<JsonArray>();
-    e.add(st.types[i]);
-    e.add(st.typeHits[i]);
-    e.add(st.typeInterval[i]);
-    e.add(st.typeJitter[i]);
-  }
-
-  // [ip, mode, seconds connected, bytes sent]
   RtcmClientInfo tinfo[MAX_TCP_CLIENTS];
   int tn = snapshotTcpClients(tinfo, MAX_TCP_CLIENTS);
-  JsonArray cl = doc["cl"].to<JsonArray>();
-  for (int i = 0; i < tn; i++) {
-    JsonArray e = cl.add<JsonArray>();
-    e.add(tinfo[i].ip);
-    e.add(tinfo[i].mode == CM_NTRIP ? "ntrip" : "raw");
-    e.add((millis() - tinfo[i].since) / 1000);
-    e.add(tinfo[i].sent);
-  }
-
   UdpClientInfo uinfo[MAX_UDP_CLIENTS];
   int un = snapshotUdpClients(uinfo, MAX_UDP_CLIENTS);
-  JsonArray ul = doc["ul"].to<JsonArray>();
-  for (int i = 0; i < un; i++) {
-    JsonArray e = ul.add<JsonArray>();
-    e.add(uinfo[i].ip);
-    e.add(uinfo[i].port);
-    e.add((millis() - uinfo[i].since) / 1000);
-    e.add(uinfo[i].sent);
+
+  uint32_t nowMs = millis();
+  char timeStr[12] = "--:--:--";
+  if (g.validTime) snprintf(timeStr, sizeof(timeStr), "%02u:%02u:%02u", g.hour, g.min, g.sec);
+
+  // These allocate a String each; done once here rather than inline.
+  String staIp = WiFi.localIP().toString();
+  String apIp  = WiFi.softAPIP().toString();
+  String ssid  = WiFi.SSID();
+
+  JBuf j(jsonBuffer, sizeof(jsonBuffer));
+  j.put('{'); j.first = true;
+
+  j.kv("seq",  (unsigned long)telemSeq);
+  j.kv("skip", (unsigned long)telemSkipped);
+  j.kv("up",   (unsigned long)(nowMs / 1000));
+  j.kv("ip",   staIp.c_str());
+  j.kv("ap",   apIp.c_str());
+  j.kv("ssid", ssid.c_str());
+  j.kv("rssi", (int)WiFi.RSSI());
+  j.kv("net",  (int)currentNetState);
+  j.kv("heap", (unsigned long)ESP.getFreeHeap());
+  j.kv("hmax", (unsigned long)ESP.getMaxAllocHeap());
+  j.kv("hmin", (unsigned long)ESP.getMinFreeHeap());
+  j.kv("model", RX_MODEL);
+  j.kv("esp",  FW_VERSION);
+
+  j.kv("lat",  g.validLoc ? g.lat : 0.0, 8);
+  j.kv("lon",  g.validLoc ? g.lon : 0.0, 8);
+  j.kv("alt",  g.validAlt ? g.alt : 0.0, 3);
+  j.kv("sep",  g.geoidSep, 3);
+  j.kv("vloc", g.validLoc);
+  j.kv("valt", g.validAlt);
+  j.kv("hdop", g.validHdop ? g.hdop : 0.0, 2);
+  j.kv("pdop", g.pdop, 2);
+  j.kv("vdop", g.vdop, 2);
+  j.kv("fq",   (int)g.fixQual);
+  j.kv("ft",   (int)g.fixType);
+  j.kv("siu",  (int)g.satsInUse);
+  j.kv("time", timeStr);
+  j.kv("pps",  (micros() - lastPps < 2000000));
+  j.kv("rtcm", (unsigned long)currentRtcmCount);
+  j.kv("tcp",  activeTcp);
+  j.kv("udp",  activeUdp);
+  j.kv("cpu0", cpu0Usage);
+  j.kv("cpu1", cpu1Usage);
+
+  j.obj("apinfo");
+    j.kv("ssid", apCfg.ssid);
+    j.kv("ch",   (int)apCfg.channel);
+    j.kv("sec",  strlen(apCfg.pass) >= 8);
+    j.kv("hide", apCfg.hidden);
+    j.kv("n",    (int)WiFi.softAPgetStationNum());
+  j.end('}');
+
+  j.obj("out");
+    j.kv("tcpEn",   outCfg.tcpEnabled);
+    j.kv("tcpPort", (int)outCfg.tcpPort);
+    j.kv("accept",  (int)outCfg.acceptMode);
+    j.kv("udpEn",   outCfg.udpEnabled);
+    j.kv("udpPort", (int)outCfg.udpPort);
+    j.kv("udpDst",  outCfg.udpDest);
+    j.kv("udpDstP", (int)outCfg.udpDestPort);
+    j.kv("udpBc",   outCfg.udpBroadcast);
+    j.kv("udpRx",   (unsigned long)udpRxCount);
+    j.kv("udpFrom", udpLastFrom);
+    j.kv("udpAge",  udpLastRxMs ? (int)((nowMs - udpLastRxMs) / 1000) : -1);
+    j.kv("mount",   outCfg.mount);
+    j.kv("user",    outCfg.ntripUser);
+    j.kv("auth",    (bool)(outCfg.ntripUser[0] || outCfg.ntripPass[0]));
+  j.end('}');
+
+  // [sysIdx, prn, elev, azim, rawSlant*100, deltaVert*100, arcSeconds, ippLat, ippLon]
+  j.arr("io");
+  for (int i = 0; i < ionoN; i++) {
+    const IonoSat &t = ionoLocal[i];
+    j.comma(); j.put('['); j.first = true;
+      j.el((int)t.sys); j.el((int)t.prn); j.el((int)t.elev); j.el((int)t.azim);
+      j.el((long)lroundf(t.slantRaw * 100));
+      j.el((long)lroundf(t.vertDelta * 100));
+      j.el((unsigned long)(t.hasRef ? (nowMs - t.arcStartMs) / 1000 : 0));
+      j.el((double)t.ippLat, 4); j.el((double)t.ippLon, 4);
+    j.end(']');
   }
+  j.end(']');
+  j.kv("ion",  ionoUsable);
+  j.kv("iond", ionoUsable ? (double)dSum / ionoUsable : 0.0, 3);
+
+  j.obj("bc");
+    j.kv("v",   bc.valid);
+    j.kv("id",  (int)bc.stationId);
+    j.kv("x",   bc.x, 4);
+    j.kv("y",   bc.y, 4);
+    j.kv("z",   bc.z, 4);
+    j.kv("age", bc.lastMs ? (int)((nowMs - bc.lastMs) / 1000) : -1);
+    j.kv("st",  (unsigned long)(bc.stableSince ? (nowMs - bc.stableSince) / 1000 : 0));
+    if (bc.valid) {
+      double la, lo, hg;
+      ecefToLla(bc.x, bc.y, bc.z, la, lo, hg);
+      j.kv("lat", la, 8); j.kv("lon", lo, 8); j.kv("hgt", hg, 3);
+    }
+  j.end('}');
+
+  j.obj("svin");
+    j.kv("feat", (int)sv.feat); j.kv("v", (int)sv.valid);
+    j.kv("obs", (unsigned long)sv.obs); j.kv("dur", (unsigned long)sv.cfgDur);
+    j.kv("acc", (double)sv.acc, 2);
+    j.kv("x", sv.x, 4); j.kv("y", sv.y, 4); j.kv("z", sv.z, 4);
+  j.end('}');
+
+  j.obj("jam");
+    j.kv("feat", (int)jm.feat); j.kv("l1", (int)jm.l1);
+    j.kv("l5", jm.haveL5 ? (int)jm.l5 : -1);
+  j.end('}');
+
+  j.obj("arp");
+    j.kv("n", (double)arpCfg.north, 3);
+    j.kv("e", (double)arpCfg.east, 3);
+    j.kv("u", (double)arpCfg.up, 3);
+  j.end('}');
+
+  j.obj("avg");
+    j.kv("run",  pa.running);
+    j.kv("el",   (unsigned long)(pa.running ? (nowMs - pa.startedMs) / 1000 : 0));
+    j.kv("tgt",  (unsigned long)pa.targetSec);
+    j.kv("n",    (unsigned long)pa.count);
+    j.kv("have", pa.haveResult);
+    j.kv("lat",  pa.lat, 8); j.kv("lon", pa.lon, 8); j.kv("alt", pa.alt, 3);
+    j.kv("rms",  (double)pa.rms, 4);
+  j.end('}');
+
+  j.obj("push");
+    j.kv("en",    pushCfg.enabled);
+    j.kv("host",  pushCfg.host);
+    j.kv("port",  (int)pushCfg.port);
+    j.kv("mount", pushCfg.mount);
+    j.kv("st",    (int)pushState.state);
+    j.kv("msg",   pushState.msg);
+    j.kv("sent",  (unsigned long)pushState.sent);
+    j.kv("retry", (unsigned long)pushState.retries);
+    j.kv("up",    (unsigned long)(pushState.state == PUSH_STREAMING
+                                  ? (nowMs - pushState.sinceMs) / 1000 : 0));
+  j.end('}');
+
+  j.obj("rst");
+    j.kv("f",   (unsigned long)st.frames);
+    j.kv("crc", (unsigned long)st.crcErrors);
+    j.kv("bps", (unsigned long)st.bytesSec);
+    j.kv("age", st.lastFrameMs ? (int)((nowMs - st.lastFrameMs) / 1000) : -1);
+    j.arr("ty");
+    for (int i = 0; i < st.typeCount; i++) {
+      j.comma(); j.put('['); j.first = true;
+        j.el((int)st.types[i]); j.el((int)st.typeHits[i]);
+        j.el((int)st.typeInterval[i]); j.el((int)st.typeJitter[i]);
+      j.end(']');
+    }
+    j.end(']');
+  j.end('}');
+
+  // [ip, mode, seconds connected, bytes sent]
+  j.arr("cl");
+  for (int i = 0; i < tn; i++) {
+    j.comma(); j.put('['); j.first = true;
+      j.el(tinfo[i].ip);
+      j.el(tinfo[i].mode == CM_NTRIP ? "ntrip" : "raw");
+      j.el((unsigned long)((nowMs - tinfo[i].since) / 1000));
+      j.el((unsigned long)tinfo[i].sent);
+    j.end(']');
+  }
+  j.end(']');
+
+  j.arr("ul");
+  for (int i = 0; i < un; i++) {
+    j.comma(); j.put('['); j.first = true;
+      j.el(uinfo[i].ip); j.el((int)uinfo[i].port);
+      j.el((unsigned long)((nowMs - uinfo[i].since) / 1000));
+      j.el((unsigned long)uinfo[i].sent);
+    j.end(']');
+  }
+  j.end(']');
 
   // [tracked, used] per constellation, in GnssSys order (SYS_UNK excluded).
-  JsonArray cons = doc["cons"].to<JsonArray>();
-  JsonArray bands = doc["bands"].to<JsonArray>();
-  for (int s = 0; s < SYS_UNK; s++) {
-    JsonArray c = cons.add<JsonArray>();
-    c.add(satTracked[s]);
-    c.add(satUsed[s]);
-
-    JsonArray b = bands.add<JsonArray>();
-    for (int k = 0; k < BANDS_PER_SYS; k++) {
-      if (BAND_NAMES[s][k] == NULL) break;
-      b.add(bandCount[s][k]);
-    }
+  j.arr("cons");
+  for (int sy = 0; sy < SYS_UNK; sy++) {
+    j.comma(); j.put('['); j.first = true;
+      j.el((int)satTracked[sy]); j.el((int)satUsed[sy]);
+    j.end(']');
   }
+  j.end(']');
+
+  j.arr("bands");
+  for (int sy = 0; sy < SYS_UNK; sy++) {
+    j.comma(); j.put('['); j.first = true;
+    for (int k = 0; k < BANDS_PER_SYS; k++) {
+      if (BAND_NAMES[sy][k] == NULL) break;
+      j.el((int)bandCount[sy][k]);
+    }
+    j.end(']');
+  }
+  j.end(']');
 
   // [sys, prn, elev, azim, snr, band, used] per tracked signal.
-  JsonArray sig = doc["sig"].to<JsonArray>();
+  j.arr("sig");
   for (int i = 0; i < sigCount; i++) {
     if (localSigs[i].sys >= SYS_UNK) continue;
-    JsonArray e = sig.add<JsonArray>();
-    e.add(localSigs[i].sys);
-    e.add(localSigs[i].prn);
-    e.add(localSigs[i].elev);
-    e.add(localSigs[i].azim);
-    e.add(localSigs[i].snr);
-    e.add(localSigs[i].band);
-    e.add(localUsed[i] ? 1 : 0);
+    j.comma(); j.put('['); j.first = true;
+      j.el((int)localSigs[i].sys);  j.el((int)localSigs[i].prn);
+      j.el((int)localSigs[i].elev); j.el((int)localSigs[i].azim);
+      j.el((int)localSigs[i].snr);  j.el((int)localSigs[i].band);
+      j.el(localUsed[i] ? 1 : 0);
+    j.end(']');
   }
+  j.end(']');
 
-  JsonObject b = doc["base"].to<JsonObject>();
-  b["m"]    = base.svinMode;
-  b["dur"]  = base.minDur;
-  b["acc"]  = base.accLimit;
-  b["x"]    = base.ecefX;
-  b["y"]    = base.ecefY;
-  b["z"]    = base.ecefZ;
-  b["rtcm"] = base.rtcmMode;
-  b["arp"]  = base.arpEnabled;
-  b["eph"]  = base.ephEnabled;
-  b["el"]   = base.svinStartMs ? (millis() - base.svinStartMs) / 1000 : 0;
-  b["ver"]  = base.verStr;
-  b["bd"]   = base.buildDate;
-  b["msg"]  = base.lastResult;
+  j.obj("base");
+    j.kv("m",    (int)base.svinMode);
+    j.kv("dur",  (unsigned long)base.minDur);
+    j.kv("acc",  (double)base.accLimit, 1);
+    j.kv("x",    base.ecefX, 4); j.kv("y", base.ecefY, 4); j.kv("z", base.ecefZ, 4);
+    j.kv("rtcm", (int)base.rtcmMode);
+    j.kv("arp",  (int)base.arpEnabled);
+    j.kv("eph",  (int)base.ephEnabled);
+    j.kv("el",   (unsigned long)(base.svinStartMs ? (nowMs - base.svinStartMs) / 1000 : 0));
+    j.kv("ver",  base.verStr);
+    j.kv("bd",   base.buildDate);
+    j.kv("msg",  base.lastResult);
+  j.end('}');
 
-  size_t jsonLen = serializeJson(doc, jsonBuffer);
+  j.put('}');
+  size_t jsonLen = j.n;
 
   AsyncWebSocketMessageBuffer * wsBuf = ws.makeBuffer(jsonLen);
   if (wsBuf) {

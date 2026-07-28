@@ -17,7 +17,7 @@ ApCfg apCfg = { AP_SSID, "", 6, false };
 bool wifiResetRequested = false;
 bool apRestartRequested = false;
 
-OutputCfg outCfg = { true, RTCM_PORT, 0, true, UDP_PORT, "", 0, false, "RTK", "", "" };
+OutputCfg outCfg = { true, RTCM_PORT, 0, true, UDP_PORT, "", 0, 0, false, "RTK", "", "" };
 RtcmStats rtcmStats = {};
 BaseBroadcast bcast = {};
 
