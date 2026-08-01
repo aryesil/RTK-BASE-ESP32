@@ -13,7 +13,7 @@
 static void startAccessPoint() {
   const char* pass = strlen(apCfg.pass) >= 8 ? apCfg.pass : NULL;
   WiFi.softAP(apCfg.ssid, pass, apCfg.channel, apCfg.hidden ? 1 : 0, 4);
-  Serial.printf("[WIFI] AP \"%s\" ch%u %s -> %s\n", apCfg.ssid, apCfg.channel,
+  Log.printf("[WIFI] AP \"%s\" ch%u %s -> %s\n", apCfg.ssid, apCfg.channel,
                 pass ? "WPA2" : "open", WiFi.softAPIP().toString().c_str());
 }
 
@@ -56,10 +56,10 @@ void setupNetwork() {
     currentNetState = NET_CONNECTING;
     WiFi.begin(targetSSID.c_str(), targetPass.c_str());
     netStateTimer = millis();
-    Serial.println("[WIFI] Joining saved network: " + targetSSID);
+    Log.println("[WIFI] Joining saved network: " + targetSSID);
   } else {
     currentNetState = NET_AP;
-    Serial.println("[WIFI] No saved network, access point only.");
+    Log.println("[WIFI] No saved network, access point only.");
   }
 
   ArduinoOTA.setHostname("ESP32-RTK-BASE");
@@ -73,7 +73,7 @@ void handleNetworkState(uint32_t now) {
 
   if (apRestartRequested) {
     apRestartRequested = false;
-    Serial.println("[WIFI] Restarting access point with new settings.");
+    Log.println("[WIFI] Restarting access point with new settings.");
     restartAccessPoint();
     return;
   }
@@ -87,7 +87,7 @@ void handleNetworkState(uint32_t now) {
     newCredentialsReceived = false;
     WiFi.disconnect(false, true);
     currentNetState = NET_AP;
-    Serial.println("[WIFI] Station credentials cleared, AP still up.");
+    Log.println("[WIFI] Station credentials cleared, AP still up.");
     return;
   }
 
@@ -97,7 +97,7 @@ void handleNetworkState(uint32_t now) {
     WiFi.begin(targetSSID.c_str(), targetPass.c_str());
     currentNetState = NET_CONNECTING;
     netStateTimer = now;
-    Serial.println("[WIFI] Connecting to: " + targetSSID);
+    Log.println("[WIFI] Connecting to: " + targetSSID);
     return;
   }
 
@@ -107,12 +107,12 @@ void handleNetworkState(uint32_t now) {
 
     case NET_CONNECTING:
       if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("[WIFI] Connected, STA IP " + WiFi.localIP().toString());
+        Log.println("[WIFI] Connected, STA IP " + WiFi.localIP().toString());
         prefs.putString("ssid", targetSSID);
         prefs.putString("pass", targetPass);
         currentNetState = NET_STA;
       } else if (now - netStateTimer > 30000) {
-        Serial.println("[WIFI] Join failed; staying on the access point.");
+        Log.println("[WIFI] Join failed; staying on the access point.");
         WiFi.disconnect(false, false);
         currentNetState = NET_AP;
       }
@@ -120,7 +120,7 @@ void handleNetworkState(uint32_t now) {
 
     case NET_STA:
       if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[WIFI] Uplink lost, reconnecting in the background...");
+        Log.println("[WIFI] Uplink lost, reconnecting in the background...");
         WiFi.reconnect();
         currentNetState = NET_RECONNECTING;
         netStateTimer = now;
@@ -129,7 +129,7 @@ void handleNetworkState(uint32_t now) {
 
     case NET_RECONNECTING:
       if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("[WIFI] Uplink restored.");
+        Log.println("[WIFI] Uplink restored.");
         currentNetState = NET_STA;
       } else if (now - netStateTimer > 60000) {
         // Retry from scratch, but the AP has been serving clients throughout.

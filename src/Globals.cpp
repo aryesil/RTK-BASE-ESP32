@@ -17,8 +17,13 @@ ApCfg apCfg = { AP_SSID, "", 6, false };
 bool wifiResetRequested = false;
 bool apRestartRequested = false;
 
-OutputCfg outCfg = { true, RTCM_PORT, 0, true, UDP_PORT, "", 0, 0, false, "RTK", "", "" };
+OutputCfg outCfg = { true, RTCM_PORT, 0, true, UDP_PORT, "", 0, 0, false, "RTK", "", "",
+                     false, USB_BAUD_DEFAULT };
 RtcmStats rtcmStats = {};
+
+volatile bool logMuted = false;
+MutedLog Log;
+UsbStats usbStats = {};
 BaseBroadcast bcast = {};
 
 IonoSat ionoSats[MAX_IONO_SATS];

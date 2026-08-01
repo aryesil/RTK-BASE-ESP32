@@ -58,11 +58,14 @@ class Device:
                      "rtcm": 1, "arp": 1, "eph": 1, "el": 0,
                      "ver": "LC29HBSNR01A01S", "bd": "2022/08/31", "msg": ""}
         self.out = {"tcpEn": True, "tcpPort": 2101, "accept": 0, "udpEn": True,
-                    "udpPort": 2102, "mount": "RTK", "user": "", "auth": False}
+                    "udpPort": 2102, "mount": "RTK", "user": "", "auth": False,
+                    "usbEn": False, "usbBaud": 115200}
         self.ap = {"ssid": "ESP32_RTK_BASE", "ch": 6, "sec": False, "hide": False, "n": 2}
         self.net = 0
         self.sta_ssid = ""
         self.frames = 0
+        self.usb_frames = 0
+        self.usb_bytes = 0
         self.svin_start = time.time()
         self.arp = {"n": 0.0, "e": 0.0, "u": 0.0}
         self.avg = {"run": False, "started": 0.0, "tgt": 300, "n": 0,
@@ -105,6 +108,10 @@ class Device:
         with self.lock:
             base = dict(self.base)
             out = dict(self.out)
+            if out["usbEn"]:
+                self.usb_frames += 14
+                self.usb_bytes += 14 * 190
+            out.update(usbFr=self.usb_frames, usbTx=self.usb_bytes, usbDrop=0)
             ap = dict(self.ap)
             net = self.net
             ssid = self.sta_ssid
@@ -412,7 +419,9 @@ class Handler(BaseHTTPRequestHandler):
                            accept=int(q.get("accept", 0)),
                            mount=(q.get("mount") or "RTK"),
                            user=q.get("user", ""),
-                           auth=bool(q.get("user") or q.get("pass")))
+                           auth=bool(q.get("user") or q.get("pass")),
+                           usbEn=q.get("usbEn", "0") == "1",
+                           usbBaud=int(q.get("usbBaud", 115200)))
         return self._json({"ok": True})
 
     def _api_net(self, q):

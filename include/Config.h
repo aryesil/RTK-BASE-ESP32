@@ -39,6 +39,17 @@
 // UDP subscribers must re-send a keepalive within this window.
 #define UDP_CLIENT_TIMEOUT_MS 30000
 
+// UART0 reaches the PC through the on-board USB bridge. Its transmit buffer has
+// to hold a complete RTCM frame with room to spare, or the rate limiter below
+// would reject every large MSM7 message. Set before Serial.begin().
+#define USB_TX_BUF 2048
+// The console runs at this rate and the RTCM stream falls back to it.
+#define USB_BAUD_DEFAULT 115200
+// Most the RTCM path may leave queued on UART0. Half the buffer, so a write
+// always finds contiguous room and returns without waiting on the line - see
+// the token bucket in DataOutput.cpp for why free space cannot be measured.
+#define USB_CREDIT_MAX (USB_TX_BUF / 2)
+
 // Terminal queue item size: "TERM:" prefix + longest NMEA sentence + NUL
 #define TERM_MSG_LEN (MAX_NMEA + 8)
 
@@ -57,4 +68,4 @@
 
 #define AP_SSID   "ESP32_RTK_BASE"
 #define RX_MODEL  "LC29H (BS)"
-#define FW_VERSION "1.0.1"
+#define FW_VERSION "1.1.0"

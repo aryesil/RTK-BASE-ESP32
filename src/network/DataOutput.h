@@ -7,6 +7,8 @@
 //   NTRIP caster HTTP/ICY handshake on the same port, sniffed on connect
 //   UDP unicast  lowest latency: no retransmit head-of-line blocking, while
 //                802.11 unicast still gives link-level ACK and retry
+//   USB serial   UART0 through the on-board bridge, no network involved. Takes
+//                the port away from the console log while it is enabled.
 //
 // Subscribing to UDP: send any datagram to UDP_PORT from the rover and repeat
 // it at least every UDP_CLIENT_TIMEOUT_MS to stay registered.

@@ -68,6 +68,105 @@ static void rebuildExpectedAuth() {
   }
 }
 
+// --------------------------------------------------------------------------
+// USB serial output
+// --------------------------------------------------------------------------
+// UART0 goes to the on-board USB bridge, so the cable that already flashes the
+// board can also carry corrections to u-center, RTKLIB or Mission Planner with
+// no network involved at all - useful for a bench setup, and immune to every
+// WiFi problem. The cost is the port itself: the console log has to stand down
+// while the stream is on, or its ASCII would land inside a frame.
+
+static uint32_t usbBaudApplied = USB_BAUD_DEFAULT;
+
+// A rate the CP2102/CH340 bridges and the common host tools all agree on.
+static bool validUsbBaud(uint32_t b) {
+  return b == 115200 || b == 230400 || b == 460800 || b == 921600;
+}
+
+// Free space cannot be used to decide this. Serial.write() ends up in IDF's
+// uart_tx_all(), which hands the data to xRingbufferSend() with portMAX_DELAY:
+// it blocks waiting for room rather than filling the buffer and returning, so
+// the ring never actually reports itself full. Measured on this board at 9600
+// baud, uart_get_tx_buffer_free_size() never fell below 1756 of 2048 bytes
+// while a single write sat blocked for 367 ms - long enough to drag core 1 to
+// 50-100% busy, break up the 1 Hz epoch structure on TCP and overflow the GNSS
+// input into CRC errors. Serial.availableForWrite() is worse still: on a full
+// buffer it falls back to reporting the 128 byte hardware FIFO, which is larger
+// than a typical RTCM frame, so the check passes exactly when it must not.
+//
+// What is knowable is how fast the line can physically drain. A token bucket
+// over the configured baud rate hands the UART no more than it can transmit,
+// so write() always finds room and returns at once.
+static uint32_t usbCreditMs = 0;
+static int32_t  usbCredit   = 0;   // bytes still allowed onto the wire
+
+static void usbCreditReset() { usbCreditMs = 0; usbCredit = 0; }
+
+static bool usbHasRoom(size_t len) {
+  uint32_t now = millis();
+  if (usbCreditMs == 0) { usbCreditMs = now; usbCredit = USB_CREDIT_MAX; }
+  uint32_t dt = now - usbCreditMs;
+  if (dt) {
+    usbCreditMs = now;
+    // 8N1 spends 10 bit times per byte, so baud/10 bytes per second.
+    usbCredit += (int32_t)((uint64_t)outCfg.usbBaud * dt / 10000);
+    // Half the buffer, not all of it: the credit ceiling is what the ring is
+    // allowed to hold, and leaving the other half free is what guarantees the
+    // next write fits without waiting. Filling it to the brim was measured to
+    // block for 471 ms.
+    if (usbCredit > (int32_t)USB_CREDIT_MAX) usbCredit = USB_CREDIT_MAX;
+  }
+  if ((int32_t)len > usbCredit) return false;
+  usbCredit -= (int32_t)len;
+  return true;
+}
+
+static void applyUsbOutput() {
+  if (!validUsbBaud(outCfg.usbBaud)) outCfg.usbBaud = USB_BAUD_DEFAULT;
+
+  // logMuted doubles as "the stream is currently on": only this function ever
+  // writes it. Saving the output form re-runs everything below, so the notices
+  // are tied to the transition rather than to the save - printing on every save
+  // would splice a line into a stream that is already running.
+  bool wasOn = logMuted;
+
+  if (outCfg.usbEnabled) {
+    if (!wasOn) {
+      // Straight to Serial, ahead of the mute, so a console left open always
+      // gets one line explaining why it is about to go quiet.
+      Serial.printf("\n[OUT] USB RTCM stream on at %u baud - console log muted.\n",
+                    (unsigned)outCfg.usbBaud);
+    }
+    logMuted = true;
+    if (outCfg.usbBaud != usbBaudApplied) {
+      Serial.flush();               // drain at the old rate before switching
+      Serial.updateBaudRate(outCfg.usbBaud);
+      usbBaudApplied = outCfg.usbBaud;
+    }
+    if (!wasOn) usbCreditReset();
+  } else {
+    if (usbBaudApplied != USB_BAUD_DEFAULT) {
+      Serial.flush();
+      Serial.updateBaudRate(USB_BAUD_DEFAULT);
+      usbBaudApplied = USB_BAUD_DEFAULT;
+    }
+    logMuted = false;
+    if (wasOn) Serial.println("[OUT] USB RTCM stream off - console log restored.");
+  }
+}
+
+static void usbStreamWrite(const uint8_t* frame, size_t len) {
+  if (!outCfg.usbEnabled) return;
+  // Same rule as every other consumer: a host that has stopped reading must
+  // never stall the GNSS core. If the whole frame does not fit right now it is
+  // dropped, because a partial write would corrupt the stream far worse than a
+  // missing epoch.
+  if (!usbHasRoom(len)) { usbStats.dropped++; return; }
+  usbStats.bytes += Serial.write(frame, len);
+  usbStats.frames++;
+}
+
 void loadOutputCfg() {
   outPrefs.begin("outcfg", false);
   outCfg.tcpEnabled = outPrefs.getBool("tcpEn", true);
@@ -81,8 +180,11 @@ void loadOutputCfg() {
   strlcpy(outCfg.mount, outPrefs.getString("mount", "RTK").c_str(), sizeof(outCfg.mount));
   strlcpy(outCfg.ntripUser, outPrefs.getString("user", "").c_str(), sizeof(outCfg.ntripUser));
   strlcpy(outCfg.ntripPass, outPrefs.getString("pass", "").c_str(), sizeof(outCfg.ntripPass));
+  outCfg.usbEnabled = outPrefs.getBool("usbEn", false);
+  outCfg.usbBaud    = outPrefs.getUInt("usbBaud", USB_BAUD_DEFAULT);
   rebuildExpectedAuth();
   resolveUdpDest();
+  applyUsbOutput();
 }
 
 void saveOutputCfg() {
@@ -97,8 +199,11 @@ void saveOutputCfg() {
   outPrefs.putString("mount", outCfg.mount);
   outPrefs.putString("user", outCfg.ntripUser);
   outPrefs.putString("pass", outCfg.ntripPass);
+  outPrefs.putBool("usbEn", outCfg.usbEnabled);
+  outPrefs.putUInt("usbBaud", outCfg.usbBaud);
   rebuildExpectedAuth();
   resolveUdpDest();
+  applyUsbOutput();
 }
 
 // --------------------------------------------------------------------------
@@ -155,7 +260,7 @@ static void applyRestart() {
     }
   }
 
-  Serial.printf("[OUT] TCP %s:%u  UDP %s:%u  mount=/%s  auth=%s\n",
+  Log.printf("[OUT] TCP %s:%u  UDP %s:%u  mount=/%s  auth=%s\n",
                 outCfg.tcpEnabled ? "on" : "off", outCfg.tcpPort,
                 udpSock >= 0 ? "on" : "off", outCfg.udpPort,
                 outCfg.mount, expectedAuth[0] ? "yes" : "no");
@@ -389,7 +494,7 @@ static void serviceUdpRegistrations() {
         udpSlots[free].lastSeen = now;
         udpSlots[free].sent = 0;
         udpSlots[free].used = true;
-        Serial.printf("[OUT] UDP subscriber %s:%u\n", ip.toString().c_str(), port);
+        Log.printf("[OUT] UDP subscriber %s:%u\n", ip.toString().c_str(), port);
       }
       xSemaphoreGive(tcpMutex);
     }
@@ -493,6 +598,10 @@ void sendRtcmFrame(const uint8_t* frame, size_t len, uint16_t msgType) {
     rtcmPaketSayaci++;
     xSemaphoreGive(dataMutex);
   }
+
+  // Ahead of the network fan-out: it is a buffered write that cannot block, and
+  // there is no reason to make it wait behind tcpMutex.
+  usbStreamWrite(frame, len);
 
   if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
     for (int i = 0; i < MAX_TCP_CLIENTS; i++) {

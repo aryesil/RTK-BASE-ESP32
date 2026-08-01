@@ -150,7 +150,7 @@ void handleNtripPush() {
         backoffMs = 5000;
         setState(PUSH_STREAMING, "Streaming");
         if (xSemaphoreTake(baseMutex, portMAX_DELAY)) {
-          Serial.printf("[NTRIP] Pushing to %s:%u/%s\n",
+          Log.printf("[NTRIP] Pushing to %s:%u/%s\n",
                         pushCfg.host, pushCfg.port, pushCfg.mount);
           xSemaphoreGive(baseMutex);
         }

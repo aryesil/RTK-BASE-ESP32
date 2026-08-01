@@ -312,7 +312,7 @@ bool sendGnssCommand(const char* cmd, unsigned long timeoutMs) {
 
   Serial2.print(cmd);
   Serial2.print("\r\n");
-  Serial.print("[GNSS-TX] "); Serial.println(cmd);
+  Log.print("[GNSS-TX] "); Log.println(cmd);
 
   char expectedAck[32] = {0};
   size_t cmdLen = strlen(cmd);
@@ -345,7 +345,7 @@ bool sendGnssCommand(const char* cmd, unsigned long timeoutMs) {
       char c = Serial2.read();
       if (c == '\n') {
         if (line.indexOf(expectedAck) != -1) {
-          Serial.print("[GNSS-RX] ACKNOWLEDGED: "); Serial.println(line);
+          Log.print("[GNSS-RX] ACKNOWLEDGED: "); Log.println(line);
           return true;
         }
         line = "";
@@ -355,8 +355,8 @@ bool sendGnssCommand(const char* cmd, unsigned long timeoutMs) {
     }
   }
 
-  Serial.print("[GNSS-ERR] TIMEOUT! Module did not acknowledge: ");
-  Serial.println(expectedAck);
+  Log.print("[GNSS-ERR] TIMEOUT! Module did not acknowledge: ");
+  Log.println(expectedAck);
   return false;
 }
 
@@ -375,7 +375,7 @@ void applyGnssConfiguration() {
         "$PAIR062,8,1*37"
     };
 
-    Serial.println("\n=== GNSS CONFIGURATION STARTING ===");
+    Log.println("\n=== GNSS CONFIGURATION STARTING ===");
     for (size_t i = 0; i < sizeof(nmeaEnables) / sizeof(nmeaEnables[0]); i++) {
         sendGnssCommand(nmeaEnables[i], 1000);
     }
@@ -387,5 +387,5 @@ void applyGnssConfiguration() {
     queryBaseConfig();
     requestOptionalMessages();
 
-    Serial.println("=== GNSS CONFIGURATION COMPLETED ===\n");
+    Log.println("=== GNSS CONFIGURATION COMPLETED ===\n");
 }

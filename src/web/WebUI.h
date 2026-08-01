@@ -557,6 +557,7 @@ code{background:#f2f5f8;padding:1px 5px;border-radius:3px;font-size:12px}
       <b>UDP unicast (lowest latency)</b><span id="epUdp">--</span>
       <b>TCP raw / NTRIP caster</b><span id="epTcp">--</span>
       <b>NTRIP mountpoint</b><span id="epMount">--</span>
+      <b>USB serial</b><span id="epUsb">--</span>
       <b>UDP datagrams received</b><span id="epUdpRx">--</span>
       <b>Uplink address (if joined)</b><span id="epSta">--</span>
     </div>
@@ -631,6 +632,54 @@ code{background:#f2f5f8;padding:1px 5px;border-radius:3px;font-size:12px}
         client) and anything else is served the raw stream, so existing rover
         setups keep working. <code>GET /</code> returns the source table.
       </div>
+    </div>
+  </div>
+
+  <div class="box">
+    <h3>USB Serial Output</h3>
+    <div class="cols">
+      <div>
+        <label class="f">Enabled</label>
+        <select id="oUsbEn"><option value="0">No</option><option value="1">Yes</option></select>
+        <label class="f">Baud rate</label>
+        <select id="oUsbBaud">
+          <option value="115200">115200</option>
+          <option value="230400">230400</option>
+          <option value="460800">460800</option>
+          <option value="921600">921600</option>
+        </select>
+        <button class="btn" onclick="saveOutput()">Save output settings</button>
+        <div class="msg" id="oUsbMsg"></div>
+      </div>
+      <div>
+        <div class="kv">
+          <b>State</b><span id="usbState">--</span>
+          <b>Frames sent</b><span id="usbFr">--</span>
+          <b>Bytes sent</b><span id="usbTx">--</span>
+          <b>Frames dropped</b><span id="usbDrop">--</span>
+        </div>
+      </div>
+    </div>
+    <div class="note">
+      Streams the same CRC-checked RTCM frames down the USB cable that flashes
+      the board, so a receiver on the PC needs no network at all. Point
+      u&#8209;center, RTKLIB or Mission Planner at the board's serial port
+      (<code>/dev/cu.usbserial-*</code>, <code>/dev/ttyUSB0</code> or
+      <code>COMn</code>) at the baud rate set here.<br><br>
+      <b>The console log is muted while this is on.</b> UART0 carries both, and
+      a log line printed between two frames would be spliced into the stream.
+      Turn this off to get boot and diagnostic messages back; OTA updates and
+      the web interface are unaffected either way.<br><br>
+      <b>Opening the port reboots the board.</b> That is the dev board's own
+      auto-reset circuit, driven by DTR/RTS, not something the firmware can
+      refuse. The setting is stored, so the stream resumes by itself &mdash; but
+      a survey-in restarts with it, so start the PC software before starting a
+      survey, or use one of the network outputs instead.<br><br>
+      <b>Frames dropped</b> counts frames skipped because the host was not
+      draining the port fast enough. A steady climb means the baud rate is too
+      low for the message set &mdash; 115200 carries roughly 11 kB/s, which is
+      ample for MSM7 on four constellations at 1 Hz, but raise it if you have
+      also raised the message rates.
     </div>
   </div>
 
@@ -1868,6 +1917,14 @@ function renderOutput(){
                          : 'none - nothing has contacted the UDP port');
   txt('epSta', staUp() ? D.ip : 'not joined');
 
+  txt('epUsb', o.usbEn ? o.usbBaud + ' baud 8N1  (console log muted)' : 'disabled');
+  txt('usbState', !o.usbEn ? 'disabled'
+      : o.usbFr ? 'streaming at ' + o.usbBaud + ' baud'
+                : 'enabled, no frames sent yet');
+  txt('usbFr', o.usbFr);
+  txt('usbTx', bytes(o.usbTx));
+  txt('usbDrop', o.usbDrop ? o.usbDrop + ' (host too slow or baud too low)' : '0');
+
   if(!outFormLoaded){
     outFormLoaded = true;
     $('oUdpEn').value = o.udpEn ? '1' : '0';
@@ -1880,6 +1937,8 @@ function renderOutput(){
     $('oAccept').value = String(o.accept);
     $('oMount').value = o.mount;
     $('oUser').value = o.user;
+    $('oUsbEn').value = o.usbEn ? '1' : '0';
+    $('oUsbBaud').value = String(o.usbBaud);
   }
 
   const cl = D.cl.map(c =>
@@ -1915,12 +1974,16 @@ function saveOutput(){
     udpBc: $('oUdpBc').value,
     tcpEn: $('oTcpEn').value, tcpPort: $('oTcpPort').value,
     accept: $('oAccept').value, mount: $('oMount').value,
-    user: $('oUser').value, pass: $('oPass').value
+    user: $('oUser').value, pass: $('oPass').value,
+    usbEn: $('oUsbEn').value, usbBaud: $('oUsbBaud').value
   });
+  // One form, two Save buttons: whichever one was pressed, the result belongs
+  // next to both.
+  const say = (m, ok) => { showMsg('oMsg', m, ok); showMsg('oUsbMsg', m, ok); };
   fetch('/api/output?' + q).then(r => r.json()).then(j => {
-    showMsg('oMsg', j.ok ? 'Saved. Listeners restarted; reconnect any consumer.' : (j.msg || 'Rejected.'), !!j.ok);
+    say(j.ok ? 'Saved. Listeners restarted; reconnect any consumer.' : (j.msg || 'Rejected.'), !!j.ok);
     outFormLoaded = false;
-  }).catch(() => showMsg('oMsg', 'Device unreachable.', false));
+  }).catch(() => say('Device unreachable.', false));
 }
 
 function drawCnEl(){

@@ -136,8 +136,8 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
 
       Serial2.print(cmd);
       Serial2.print("\r\n");
-      Serial.print("[WS] Command Sent to Module: ");
-      Serial.println(cmd);
+      Log.print("[WS] Command Sent to Module: ");
+      Log.println(cmd);
     }
   }
 }
@@ -306,6 +306,13 @@ static void handleOutputApi(AsyncWebServerRequest *request) {
     if (request->hasParam("pass"))
       strlcpy(outCfg.ntripPass, request->getParam("pass")->value().c_str(), sizeof(outCfg.ntripPass));
 
+    if (request->hasParam("usbEn")) outCfg.usbEnabled = request->getParam("usbEn")->value().toInt() != 0;
+    if (request->hasParam("usbBaud")) {
+      // saveOutputCfg() rejects anything off the supported list and falls back
+      // to the console rate, so a bad value cannot leave the port unusable.
+      outCfg.usbBaud = (uint32_t)request->getParam("usbBaud")->value().toInt();
+    }
+
     saveOutputCfg();
     request->send(200, "application/json", "{\"ok\":true}");
     restartDataOutput();
@@ -410,7 +417,7 @@ void setupWebServer() {
 
   server.on("/reboot", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send(200, "text/plain", "Rebooting");
-    Serial.println("[SYS] Reboot requested from web UI");
+    Log.println("[SYS] Reboot requested from web UI");
     // Let the response flush before pulling the rug out.
     xTaskCreate([](void*){ vTaskDelay(pdMS_TO_TICKS(400)); ESP.restart(); },
                 "reboot", 2048, NULL, 1, NULL);
@@ -711,6 +718,11 @@ void handleTelemetry(uint32_t now) {
     j.kv("mount",   outCfg.mount);
     j.kv("user",    outCfg.ntripUser);
     j.kv("auth",    (bool)(outCfg.ntripUser[0] || outCfg.ntripPass[0]));
+    j.kv("usbEn",   outCfg.usbEnabled);
+    j.kv("usbBaud", (unsigned long)outCfg.usbBaud);
+    j.kv("usbTx",   (unsigned long)usbStats.bytes);
+    j.kv("usbFr",   (unsigned long)usbStats.frames);
+    j.kv("usbDrop", (unsigned long)usbStats.dropped);
   j.end('}');
 
   // [sysIdx, prn, elev, azim, rawSlant*100, deltaVert*100, arcSeconds, ippLat, ippLon]

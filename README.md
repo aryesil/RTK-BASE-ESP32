@@ -12,6 +12,7 @@ This project turns an ESP32 into a networked RTK base station. It receives RTCM3
 <h3>Validated RTCM3 forwarding</h3>  Frames are reassembled and CRC-24Q checked before they leave the device. NMEA is stripped out, so the radio link carries corrections only.
 <h3>NTRIP caster</h3>  NTRIP v1 (<code>ICY 200 OK</code>) and v2 on the same port as the raw stream, auto-detected per connection, with a source table and optional Basic authentication.
 <h3>UDP output</h3>  Fixed destination, subnet broadcast or client registration. One datagram per RTCM frame, so a lost packet costs one epoch instead of stalling the stream behind a TCP retransmit.
+<h3>USB serial output</h3>  The same RTCM frames on UART0, so a receiver on the PC works over the flashing cable with no network at all.
 <h3>NTRIP push</h3>  The base connects outbound to a caster such as RTK2go and uploads with the v1 <code>SOURCE</code> handshake, with backoff on failure.
 <h3>Survey-In and Fixed base modes</h3>  Configured from the web page, with live progress, observation count and mean accuracy read from the receiver itself.
 <h3>Broadcast position readback</h3>  RTCM 1005 is decoded back out of the outgoing stream, so the interface shows the coordinate that is really being sent rather than the one that was configured.
@@ -119,6 +120,7 @@ Module and firmware versions, uptime, free heap, CPU load per core, PPS status a
 | NTRIP caster | 2101 | same port, auto-detected per connection |
 | UDP | 2102 | fixed destination, broadcast or registration |
 | NTRIP push | outbound | this base uploads to a remote caster |
+| USB serial | UART0 | no network; takes the port from the console log |
 
 <h3>NTRIP caster</h3>
 
@@ -138,6 +140,24 @@ Three ways to receive it:
 - **Registration** — the rover sends any datagram to the port and repeats it every 30 s; its source address then receives the stream.
 
 > **Mission Planner:** use **UDP Host** (not UDP Client) on port 2102 with broadcast enabled, or give the fixed destination its address and listen port. A UDP client socket calls `connect()`, and a connected UDP socket does not accept broadcast datagrams — that is standard socket behaviour, not a quirk of this firmware.
+
+<h3>USB serial</h3>
+
+Streams the same CRC-checked frames down the cable that flashes the board. Point u-center, RTKLIB or Mission Planner at the serial port at the configured rate:
+
+```text
+macOS:    /dev/cu.usbserial-*
+Linux:    /dev/ttyUSB0
+Windows:  COMn
+```
+
+Baud is selectable between 115200 and 921600. 115200 carries roughly 11 kB/s, ample for MSM7 on four constellations at 1 Hz; raise it only if you have also raised the message rates.
+
+> UART0 carries the console log as well, so **the log is muted while this output is enabled** — otherwise a log line printed between two frames would be spliced into the stream. Turn the output off to get boot and diagnostic messages back. OTA updates and the web interface are unaffected either way.
+
+> **Opening the serial port reboots the board.** This is the dev board's own DTR/RTS auto-reset circuit and no firmware setting can decline it. The output setting is stored in NVS so the stream comes back on its own, but an in-progress survey-in restarts with it. Start the PC software first, or use a network output for a running base.
+
+Writes are rate limited to what the selected baud can physically carry, so a host that stops draining the port can never stall the correction path. Frames that do not fit are dropped and counted: a steadily climbing **frames dropped** means the baud is too low for the message set. Measured at 115200 with MSM7 on four constellations at 1 Hz, nothing is dropped and core 1 stays at its idle 9%.
 
 <h3>NTRIP push</h3>
 
@@ -241,6 +261,7 @@ These are designed for the Quectel LC29H(BS) module. If your GNSS receiver uses 
 <h3>Max tracked signals:</h3> 120 (MAX_SIGNALS in Config.h)
 <h3>NMEA buffer size:</h3> 256 chars (MAX_NMEA in Config.h)
 <h3>Serial2 RX buffer:</h3> 2048 bytes (set at runtime in setupGNSS())
+<h3>UART0 TX buffer:</h3> 2048 bytes (USB_TX_BUF in Config.h; must hold a whole RTCM frame)
 <h3>Ionospheric shell height:</h3> 350 km (IONO_SHELL_KM in Config.h)
 
 <h2>Testing Without Hardware</h2>

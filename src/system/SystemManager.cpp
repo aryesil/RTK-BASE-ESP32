@@ -2,7 +2,11 @@
 #include <Globals.h>
 
 void initHardware() {
-    Serial.begin(115200);
+    // Must precede begin(). Without it UART0 buffers barely more than the
+    // hardware FIFO, and the USB RTCM output would drop every frame larger than
+    // that instead of the occasional one.
+    Serial.setTxBufferSize(USB_TX_BUF);
+    Serial.begin(USB_BAUD_DEFAULT);
     pinMode(PPS_PIN, INPUT);
     attachInterrupt(digitalPinToInterrupt(PPS_PIN), ppsKesmesi, RISING);
 }

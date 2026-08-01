@@ -192,8 +192,39 @@ struct OutputCfg {
   char     mount[24];    // NTRIP mountpoint, without the leading '/'
   char     ntripUser[24];
   char     ntripPass[24]; // empty user AND pass = unauthenticated
+  // RTCM out of UART0, i.e. the USB cable already attached for flashing. Costs
+  // no network at all, but the console log has to give up the port - see
+  // logMuted below.
+  bool     usbEnabled;
+  uint32_t usbBaud;
 };
 extern OutputCfg outCfg;
+
+// Debug text and binary RTCM share UART0, and a log line printed mid-frame
+// would be spliced straight into the stream: the receiver drops the frame and
+// resyncs on the next preamble. So the log gives way while the stream is live.
+// Every diagnostic print in the firmware goes through `Log` for exactly this
+// reason - use it instead of Serial, which stays reserved for the stream and
+// for the few notices that must appear even when muted.
+extern volatile bool logMuted;
+
+class MutedLog : public Print {
+ public:
+  size_t write(uint8_t c) override {
+    return logMuted ? 1 : Serial.write(c);
+  }
+  size_t write(const uint8_t* buf, size_t n) override {
+    return logMuted ? n : Serial.write(buf, n);
+  }
+};
+extern MutedLog Log;
+
+struct UsbStats {
+  uint32_t bytes;    // RTCM bytes handed to UART0 since boot
+  uint32_t frames;
+  uint32_t dropped;  // frames skipped: the host stopped draining the port
+};
+extern UsbStats usbStats;
 
 struct RtcmStats {
   uint32_t frames;        // valid frames forwarded since boot

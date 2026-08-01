@@ -31,8 +31,8 @@ void sendNmeaSentence(const String &body) {
   String cmd = buildNmeaSentence(body);
   Serial2.print(cmd);
   Serial2.print("\r\n");
-  Serial.print("[GNSS-TX] ");
-  Serial.println(cmd);
+  Log.print("[GNSS-TX] ");
+  Log.println(cmd);
 
   char msg[TERM_MSG_LEN];
   snprintf(msg, sizeof(msg), "TXCMD:%s", cmd.c_str());
