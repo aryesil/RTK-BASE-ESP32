@@ -12,6 +12,9 @@ This project turns an ESP32 into a networked RTK base station. It receives RTCM3
 <h3>Validated RTCM3 forwarding</h3>  Frames are reassembled and CRC-24Q checked before they leave the device. NMEA is stripped out, so the radio link carries corrections only.
 <h3>NTRIP caster</h3>  NTRIP v1 (<code>ICY 200 OK</code>) and v2 on the same port as the raw stream, auto-detected per connection, with a source table and optional Basic authentication.
 <h3>UDP output</h3>  Fixed destination, subnet broadcast or client registration. One datagram per RTCM frame, so a lost packet costs one epoch instead of stalling the stream behind a TCP retransmit.
+<h3>Twelve hour history</h3>  Receiver health sampled every 30 s into a ring buffer and plotted on its own page: position drift, satellite count, mean C/N0, HDOP, correction output, and fix quality and interference as continuous colour strips.
+<h3>Rover visibility</h3>  NTRIP clients send a GGA back up the connection; it is parsed rather than discarded, so the consumer table shows each rover's fix quality, satellite count and baseline from the broadcast station position.
+<h3>Settings backup</h3>  The whole configuration, including the station coordinate held in the module, downloaded as one file and restorable from the Admin page.
 <h3>USB serial output</h3>  The same RTCM frames on UART0, so a receiver on the PC works over the flashing cable with no network at all.
 <h3>NTRIP push</h3>  The base connects outbound to a caster such as RTK2go and uploads with the v1 <code>SOURCE</code> handshake, with backoff on failure.
 <h3>Survey-In and Fixed base modes</h3>  Configured from the web page, with live progress, observation count and mean accuracy read from the receiver itself.
@@ -158,6 +161,18 @@ Baud is selectable between 115200 and 921600. 115200 carries roughly 11 kB/s, am
 > **Opening the serial port reboots the board.** This is the dev board's own DTR/RTS auto-reset circuit and no firmware setting can decline it. The output setting is stored in NVS so the stream comes back on its own, but an in-progress survey-in restarts with it. Start the PC software first, or use a network output for a running base.
 
 Writes are rate limited to what the selected baud can physically carry, so a host that stops draining the port can never stall the correction path. Frames that do not fit are dropped and counted: a steadily climbing **frames dropped** means the baud is too low for the message set. Measured at 115200 with MSM7 on four constellations at 1 Hz, nothing is dropped and core 1 stays at its idle 9%.
+
+<h3>Rover visibility</h3>
+
+The NTRIP protocol has clients send an NMEA `GGA` sentence back to the caster, so a network caster can pick the nearest base. Nothing here needs it to serve the stream, but it is the only signal a base ever gets about whether its corrections actually worked, so the consumer table reports it:
+
+| Column | Meaning |
+| --- | --- |
+| Rover fix | GGA quality: `single`, `DGPS`, `RTK float`, `RTK fixed`, with satellite count and HDOP |
+| Baseline | Ground distance from the coordinate this base is broadcasting |
+| Reported | Age of the last GGA; `not reported` for a client that never sends one |
+
+A raw TCP consumer has no back channel and a UDP subscriber is not a connection at all, so both are shown as such rather than as a rover without a fix. Clients that never report are left blank instead of being counted as broken.
 
 <h3>NTRIP push</h3>
 
@@ -322,6 +337,33 @@ Measured on an ESP32-WROOM-32D tracking 39 satellites: **2 % load on each core**
 └── docs/img/                   # Interface screenshots
 
 ````
+
+<h2>History</h2>
+
+Every other panel shows the current instant, which is the wrong resolution for what actually goes wrong with a base station: a solution wandering over an afternoon, carrier-to-noise sagging as water finds a connector, interference that turns up at the same time each evening. The History page plots the last twelve hours.
+
+| Chart | Reads as |
+| --- | --- |
+| Where the receiver thinks it is | North/East/Up in centimetres from the position at the start of the window. The station is not moving, so all of it is measurement error: flat is healthy, a slow ramp is normal for a standalone solution, a sharp step means something changed |
+| Satellites in the solution | Used in the fix and tracked, the same two figures as the header. A daily pattern usually means part of the sky is blocked |
+| Signal strength | Mean C/N0 over everything tracked, against the window's own median rather than a fixed threshold |
+| Position dilution | HDOP; under 1.0 is good geometry |
+| Correction output | RTCM bytes per second; a drop to zero is an outage rovers felt |
+| Fix quality / L1 / L5 | Continuous colour strips, so an outage or an interference burst reads as a block rather than a spike |
+
+Both satellite figures are floors rather than exact counts. An NMEA `GSA` sentence carries at most twelve satellites and this module emits one per constellation, so GPS and BeiDou sit at twelve whenever the receiver is using more than that. The receiver's own count in `GGA` field 7 runs higher still — higher than the number of satellites `GSV` reports as tracked — so on this dual-frequency module it is counting signals rather than satellites, and it is deliberately not plotted.
+
+Sampling is every 30 s into a 1440-entry ring, 23 kB of RAM. It is served as a binary blob rather than JSON — the same records as text would have cost roughly 58 kB and the heap to build it — and fetched only when the page is open, so the 1 Hz telemetry stream is untouched.
+
+> The buffer lives in RAM and **starts over on reboot**. It is a monitoring window, not an archive; for a permanent record, log the RTCM stream on a PC with `str2str`.
+
+<h2>Settings Backup</h2>
+
+The Admin page downloads every setting the device holds as a single JSON file: access point and station credentials, all four output transports, the NTRIP caster and push configuration, and the antenna reference point offset. The station coordinate and survey settings are included too — those live in the GNSS module's own memory, and a `$PQTMRESTOREPAR` or a swapped module loses them otherwise.
+
+Restoring applies every field present in the file and reboots; anything the file omits is left alone. The station coordinate is written back to the module, so a backup taken at a different site will move the base.
+
+> The file holds the WiFi key and both NTRIP passwords **in plain text**. That is what makes it a usable backup rather than a half one, but keep it where you would keep those passwords.
 
 <h2>Known Limitations</h2>
 

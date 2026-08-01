@@ -8,12 +8,14 @@
 #include <gnss/BaseConfig.h>
 #include <network/NtripPush.h>
 #include <gnss/Iono.h>
+#include <system/History.h>
 
 void setup() {
     initHardware();
     initSystemResources();
     initBaseConfig();
     initIono();
+    historyInit();
     setupGNSS();
 
     setupNetwork();

@@ -8,6 +8,7 @@
 #include <network/NtripPush.h>
 #include <stdarg.h>
 #include <gnss/Iono.h>
+#include <system/History.h>
 
 // Escapes a string for embedding in a JSON string literal. SSIDs are arbitrary
 // bytes and would otherwise break the /scan response (or leak into the page).
@@ -323,6 +324,178 @@ static void handleOutputApi(AsyncWebServerRequest *request) {
 }
 
 // --------------------------------------------------------------------------
+// Settings backup
+// --------------------------------------------------------------------------
+// Everything the ESP32 owns, plus the station coordinate. That last part lives
+// in the module's own memory rather than here, which is exactly why it belongs
+// in the backup: a replaced module, or a $PQTMRESTOREPAR, loses it otherwise.
+static void handleBackupApi(AsyncWebServerRequest *request) {
+  static char buf[1536];
+  JBuf j(buf, sizeof(buf));
+  j.put('{'); j.first = true;
+    j.kv("fw", FW_VERSION);
+
+    j.obj("ap");
+      j.kv("ssid", apCfg.ssid);
+      j.kv("pass", apCfg.pass);
+      j.kv("ch",   (int)apCfg.channel);
+      j.kv("hide", apCfg.hidden);
+    j.end('}');
+
+    j.obj("sta");
+      j.kv("ssid", targetSSID.c_str());
+      j.kv("pass", targetPass.c_str());
+    j.end('}');
+
+    j.obj("out");
+      j.kv("tcpEn",   outCfg.tcpEnabled);
+      j.kv("tcpPort", (int)outCfg.tcpPort);
+      j.kv("accept",  (int)outCfg.acceptMode);
+      j.kv("udpEn",   outCfg.udpEnabled);
+      j.kv("udpPort", (int)outCfg.udpPort);
+      j.kv("udpDst",  outCfg.udpDest);
+      j.kv("udpDstP", (int)outCfg.udpDestPort);
+      j.kv("udpBc",   outCfg.udpBroadcast);
+      j.kv("mount",   outCfg.mount);
+      j.kv("user",    outCfg.ntripUser);
+      j.kv("pass",    outCfg.ntripPass);
+      j.kv("usbEn",   outCfg.usbEnabled);
+      j.kv("usbBaud", (unsigned long)outCfg.usbBaud);
+    j.end('}');
+
+    j.obj("push");
+      j.kv("en",    pushCfg.enabled);
+      j.kv("host",  pushCfg.host);
+      j.kv("port",  (int)pushCfg.port);
+      j.kv("mount", pushCfg.mount);
+      j.kv("pass",  pushCfg.pass);
+    j.end('}');
+
+    j.obj("arp");
+      j.kv("n", (double)arpCfg.north, 3);
+      j.kv("e", (double)arpCfg.east, 3);
+      j.kv("u", (double)arpCfg.up, 3);
+    j.end('}');
+
+    // Mirrored from the module. Restoring these re-issues $PQTMCFGSVIN.
+    j.obj("base");
+      j.kv("mode", (int)baseCfg.svinMode);
+      j.kv("dur",  (unsigned long)baseCfg.minDur);
+      j.kv("acc",  (double)baseCfg.accLimit, 2);
+      j.kv("x",    baseCfg.ecefX, 4);
+      j.kv("y",    baseCfg.ecefY, 4);
+      j.kv("z",    baseCfg.ecefZ, 4);
+    j.end('}');
+  j.end('}');
+
+  AsyncWebServerResponse *r = request->beginResponse(200, "application/json", buf);
+  r->addHeader("Content-Disposition",
+               "attachment; filename=\"rtk-base-settings.json\"");
+  request->send(r);
+}
+
+// Restore arrives as a POST body: a settings document does not fit comfortably
+// in a query string, and every other endpoint here is a small GET.
+//
+// The body callback only parses and applies; the response is sent from the
+// request callback, which always runs afterwards. Answering from both means
+// the later one silently overwrites the earlier - which looked exactly like a
+// rejected restore that had in fact already been applied.
+static bool restoreDone = false;
+static char restoreMsg[96];
+
+static void handleRestoreBody(AsyncWebServerRequest *request, uint8_t *data,
+                              size_t len, size_t index, size_t total) {
+  static String body;
+  if (index == 0) body = "";
+  body.concat((const char*)data, len);
+  if (index + len < total) return;
+
+  restoreDone = true;
+
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) {
+    strlcpy(restoreMsg, "{\"ok\":false,\"msg\":\"Not a valid settings file\"}",
+            sizeof(restoreMsg));
+    body = "";
+    return;
+  }
+
+  int applied = 0;
+  {
+    BaseLockWeb lock;
+    if (JsonObject o = doc["ap"].as<JsonObject>()) {
+      if (o["ssid"].is<const char*>()) strlcpy(apCfg.ssid, o["ssid"], sizeof(apCfg.ssid));
+      if (o["pass"].is<const char*>()) strlcpy(apCfg.pass, o["pass"], sizeof(apCfg.pass));
+      if (o["ch"].is<int>())   apCfg.channel = (uint8_t)o["ch"].as<int>();
+      if (o["hide"].is<bool>()) apCfg.hidden = o["hide"];
+      saveApConfig();
+      applied++;
+    }
+    if (JsonObject o = doc["out"].as<JsonObject>()) {
+      if (o["tcpEn"].is<bool>())  outCfg.tcpEnabled = o["tcpEn"];
+      if (o["tcpPort"].is<int>()) outCfg.tcpPort = (uint16_t)o["tcpPort"].as<int>();
+      if (o["accept"].is<int>())  outCfg.acceptMode = (uint8_t)o["accept"].as<int>();
+      if (o["udpEn"].is<bool>())  outCfg.udpEnabled = o["udpEn"];
+      if (o["udpPort"].is<int>()) outCfg.udpPort = (uint16_t)o["udpPort"].as<int>();
+      if (o["udpDst"].is<const char*>()) strlcpy(outCfg.udpDest, o["udpDst"], sizeof(outCfg.udpDest));
+      if (o["udpDstP"].is<int>()) outCfg.udpDestPort = (uint16_t)o["udpDstP"].as<int>();
+      if (o["udpBc"].is<bool>())  outCfg.udpBroadcast = o["udpBc"];
+      if (o["mount"].is<const char*>()) strlcpy(outCfg.mount, o["mount"], sizeof(outCfg.mount));
+      if (o["user"].is<const char*>())  strlcpy(outCfg.ntripUser, o["user"], sizeof(outCfg.ntripUser));
+      if (o["pass"].is<const char*>())  strlcpy(outCfg.ntripPass, o["pass"], sizeof(outCfg.ntripPass));
+      if (o["usbEn"].is<bool>())  outCfg.usbEnabled = o["usbEn"];
+      if (o["usbBaud"].is<unsigned long>()) outCfg.usbBaud = o["usbBaud"];
+      saveOutputCfg();
+      applied++;
+    }
+    if (JsonObject o = doc["push"].as<JsonObject>()) {
+      if (o["en"].is<bool>())    pushCfg.enabled = o["en"];
+      if (o["host"].is<const char*>())  strlcpy(pushCfg.host, o["host"], sizeof(pushCfg.host));
+      if (o["port"].is<int>())   pushCfg.port = (uint16_t)o["port"].as<int>();
+      if (o["mount"].is<const char*>()) strlcpy(pushCfg.mount, o["mount"], sizeof(pushCfg.mount));
+      if (o["pass"].is<const char*>())  strlcpy(pushCfg.pass, o["pass"], sizeof(pushCfg.pass));
+      saveNtripPushCfg();
+      applied++;
+    }
+    if (JsonObject o = doc["arp"].as<JsonObject>()) {
+      if (o["n"].is<float>()) arpCfg.north = o["n"];
+      if (o["e"].is<float>()) arpCfg.east  = o["e"];
+      if (o["u"].is<float>()) arpCfg.up    = o["u"];
+      saveArpCfg();
+      applied++;
+    }
+  }
+
+  if (JsonObject o = doc["sta"].as<JsonObject>()) {
+    if (o["ssid"].is<const char*>() && strlen(o["ssid"])) {
+      targetSSID = (const char*)o["ssid"];
+      targetPass = o["pass"].is<const char*>() ? (const char*)o["pass"] : "";
+      prefs.putString("ssid", targetSSID);
+      prefs.putString("pass", targetPass);
+      applied++;
+    }
+  }
+
+  // Last, and outside the lock: this one talks to the module over the serial
+  // link rather than touching a struct.
+  if (JsonObject o = doc["base"].as<JsonObject>()) {
+    int mode = o["mode"].is<int>() ? o["mode"].as<int>() : -1;
+    if (mode >= 0 && mode <= 2) {
+      applySvinConfig(mode,
+                      o["dur"].is<unsigned long>() ? o["dur"].as<uint32_t>() : 43200,
+                      o["acc"].is<float>() ? o["acc"].as<float>() : 15.0f,
+                      o["x"] | 0.0, o["y"] | 0.0, o["z"] | 0.0);
+      applied++;
+    }
+  }
+
+  snprintf(restoreMsg, sizeof(restoreMsg),
+           "{\"ok\":true,\"applied\":%d,\"msg\":\"Restored, rebooting\"}", applied);
+  body = "";
+}
+
+// --------------------------------------------------------------------------
 // Network endpoint
 // --------------------------------------------------------------------------
 static void handleNetApi(AsyncWebServerRequest *request) {
@@ -423,6 +596,38 @@ void setupWebServer() {
                 "reboot", 2048, NULL, 1, NULL);
   });
 
+  server.on("/api/history", HTTP_GET, [](AsyncWebServerRequest *request){
+    size_t len = 0;
+    const uint8_t *b = historySnapshot(len);
+    // Sent straight from the static buffer. A sample may be rewritten while
+    // the response streams; one record briefly mixing an old and a new field
+    // is invisible on a twelve hour chart, and copying 23 kB to avoid it would
+    // not be.
+    AsyncWebServerResponse *r =
+        request->beginResponse(200, "application/octet-stream", b, len);
+    r->addHeader("Cache-Control", "no-store");
+    request->send(r);
+  });
+  server.on("/api/backup", HTTP_GET, handleBackupApi);
+  server.on("/api/restore", HTTP_POST,
+            [](AsyncWebServerRequest *r){
+              if (!restoreDone) {
+                // The body never reached the handler: the server parses an
+                // urlencoded body away as request parameters.
+                r->send(415, "application/json",
+                        "{\"ok\":false,\"msg\":\"Send the file as "
+                        "Content-Type: application/json\"}");
+                return;
+              }
+              restoreDone = false;
+              bool ok = strstr(restoreMsg, "\"ok\":true") != NULL;
+              r->send(ok ? 200 : 400, "application/json", restoreMsg);
+              // Deferred so the response flushes and the module has time to
+              // acknowledge the survey command.
+              if (ok) xTaskCreate([](void*){ vTaskDelay(pdMS_TO_TICKS(1200));
+                                             ESP.restart(); },
+                                  "restore", 2048, NULL, 1, NULL);
+            }, NULL, handleRestoreBody);
   server.on("/api/base", HTTP_GET, handleBaseApi);
   server.on("/api/output", HTTP_GET, handleOutputApi);
   server.on("/api/net", HTTP_GET, handleNetApi);
@@ -644,6 +849,29 @@ void handleTelemetry(uint32_t now) {
       ionoUsable++; dSum += fabsf(ionoLocal[i].vertDelta);
     }
 
+  // Mean carrier-to-noise across everything currently tracked. One number is
+  // enough to show an antenna or cable going bad over hours, which is what the
+  // history is for; the per-satellite detail already lives on the GNSS page.
+  uint32_t cnSum = 0; int cnN = 0;
+  for (int i = 0; i < sigCount; i++)
+    if (localSigs[i].snr > 0) { cnSum += localSigs[i].snr; cnN++; }
+
+  // Not g.satsInUse: GGA field 7 on this module reports more than the number of
+  // satellites GSV says are tracked, so it is counting something else - signals,
+  // most likely, on a dual-frequency receiver. These two are the figures the
+  // header shows, counted from GSV and GSA.
+  uint8_t histTracked = 0, histUsed = 0;
+  for (int i = 0; i < SYS_COUNT; i++) { histTracked += satTracked[i]; histUsed += satUsed[i]; }
+
+  historyFeed(millis(), histUsed, histTracked,
+              cnN ? (uint8_t)(cnSum / cnN) : 0,
+              g.validHdop ? g.hdop : 0.0,
+              g.fixQual, jam.l1, jam.l5,
+              g.validLoc && g.validAlt,
+              g.lat, g.lon, g.alt,
+              rtcmStats.bytesSec,
+              ionoUsable ? dSum / ionoUsable : -1.0f);
+
   RtcmClientInfo tinfo[MAX_TCP_CLIENTS];
   int tn = snapshotTcpClients(tinfo, MAX_TCP_CLIENTS);
   UdpClientInfo uinfo[MAX_UDP_CLIENTS];
@@ -812,7 +1040,10 @@ void handleTelemetry(uint32_t now) {
     j.end(']');
   j.end('}');
 
-  // [ip, mode, seconds connected, bytes sent]
+  // [ip, mode, seconds connected, bytes sent, fixQual, sats, hdop, baseline m,
+  //  gga age s, lat, lon]
+  // Everything from index 4 on comes from the rover's own GGA; a consumer that
+  // never reports leaves them at 0 / -1.
   j.arr("cl");
   for (int i = 0; i < tn; i++) {
     j.comma(); j.put('['); j.first = true;
@@ -820,6 +1051,14 @@ void handleTelemetry(uint32_t now) {
       j.el(tinfo[i].mode == CM_NTRIP ? "ntrip" : "raw");
       j.el((unsigned long)((nowMs - tinfo[i].since) / 1000));
       j.el((unsigned long)tinfo[i].sent);
+      j.el((int)tinfo[i].fixQual);
+      j.el((int)tinfo[i].sats);
+      j.el((double)tinfo[i].hdop, 2);
+      j.el((double)tinfo[i].baseline, 1);
+      j.el(tinfo[i].ggaAgeMs == 0xFFFFFFFF ? -1L
+                                           : (long)(tinfo[i].ggaAgeMs / 1000));
+      j.el(tinfo[i].hasFix ? tinfo[i].lat : 0.0, 7);
+      j.el(tinfo[i].hasFix ? tinfo[i].lon : 0.0, 7);
     j.end(']');
   }
   j.end(']');

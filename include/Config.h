@@ -36,6 +36,13 @@
 #define NTRIP_REQ_MS   5000
 #define NTRIP_REQ_MAX  384
 
+// Longest NMEA sentence accepted back from a consumer. Rovers send GGA; a
+// longer line is a client that is not speaking NMEA and gets discarded.
+#define NMEA_BACK_MAX 96
+// A rover report older than this is stale: the client is connected but no
+// longer telling us anything.
+#define ROVER_GGA_STALE_MS 60000
+
 // UDP subscribers must re-send a keepalive within this window.
 #define UDP_CLIENT_TIMEOUT_MS 30000
 
@@ -66,6 +73,12 @@
 // Ionospheric shell height used for the pierce point, kilometres.
 #define IONO_SHELL_KM 350.0
 
+// Twelve hours at half-minute resolution. A base station's problems are slow -
+// a drifting solution, a connector letting go, interference that shows up at
+// the same time every evening - so the window matters more than the rate.
+#define HISTORY_SAMPLES     1440
+#define HISTORY_INTERVAL_MS 30000
+
 #define AP_SSID   "ESP32_RTK_BASE"
 #define RX_MODEL  "LC29H (BS)"
-#define FW_VERSION "1.1.0"
+#define FW_VERSION "1.2.0"

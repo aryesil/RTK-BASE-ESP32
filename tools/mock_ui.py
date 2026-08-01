@@ -104,6 +104,34 @@ class Device:
                 out.append([si, prn, el, az, random.randint(30, 50), b, used])
         return out
 
+    def history_blob(self):
+        """A full 12 h window with the kinds of events the page exists to show:
+        a slow vertical drift, an afternoon of weaker signal, a short output
+        outage and a burst of L1 interference."""
+        import struct, math
+        N, IV = 1440, 30
+        hdr = struct.pack("<IHHHHIII", 0x484B5452, N, IV, 0, N, N * IV, 0, 0)
+        hdr += struct.pack("<ddd", 52.0182, 4.3891, 43.2)
+        out = bytearray(hdr)
+        for k in range(N):                       # 0 = oldest
+            t = k / N                            # 0..1 across the window
+            sats = 46 + int(8 * math.sin(t * math.pi * 3)) + (k % 3)
+            cn0 = 41 - int(6 * max(0.0, math.sin((t - 0.45) * math.pi * 2.2)))
+            hdop = int((0.55 + 0.25 * abs(math.sin(t * math.pi * 4))) * 100)
+            fix = 4 if 0.08 < t < 0.93 else 5
+            j1 = 3 if 0.62 < t < 0.66 else (2 if 0.60 < t < 0.68 else 1)
+            j5 = 1
+            flags = (fix & 15) | (j1 << 4) | (j5 << 6)
+            iono = 8 + int(4 * math.sin(t * math.pi * 2))
+            dn = int(14 * math.sin(t * math.pi * 5) + 3 * math.sin(t * 40))
+            de = int(11 * math.cos(t * math.pi * 4) + 3 * math.cos(t * 37))
+            du = int(-70 * t + 9 * math.sin(t * 33))   # slow settle downward
+            bps = 0 if 0.34 < t < 0.36 else 1230 + (k % 40)
+            tracked = sats + 9 + (k % 4)          # izlenen her zaman fixtekinden fazla
+            out += struct.pack("<BBHBBhhhHBB", max(0, sats), cn0, hdop, flags,
+                               iono, dn, de, du, bps, 1, tracked)
+        return bytes(out)
+
     def snapshot(self):
         with self.lock:
             base = dict(self.base)
@@ -151,8 +179,15 @@ class Device:
                     "ty": [[1005, frames // 60, 10000, 42], [1077, frames, 1000, 12],
                            [1087, frames, 1000, 15], [1097, frames, 1000, 11],
                            [1127, frames, 1000, 18], [1019, frames // 150, 30000, 90]]},
-            "cl": [["192.168.4.3", "ntrip", 940, 1250000],
-                   ["192.168.1.77", "raw", 120, 86000]],
+            # [ip, mode, connected s, sent, fixQual, sats, hdop, baseline m,
+            #  gga age s, lat, lon] - a rover that reports, one that does not,
+            #  and a raw consumer with no back channel at all.
+            "cl": [["192.168.4.3", "ntrip", 940, 1250000, 4, 27, 0.62,
+                    1840.5, 1, 52.0182, 4.3891],
+                   ["192.168.4.8", "ntrip", 310, 402000, 5, 21, 0.95,
+                    7420.0, 3, 52.0611, 4.3120],
+                   ["192.168.1.77", "raw", 120, 86000, 0, 0, 0.0, -1.0, -1,
+                    0.0, 0.0]],
             "ul": [["192.168.4.5", 9000, 300, 410000],
                    ["192.168.4.9", 9000, 15, 9800]],
             "cons": cons, "bands": bands, "sig": sig, "base": base,
@@ -295,6 +330,33 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     # ------------------------------------------------------------------ routes
+    def do_POST(self):
+        from urllib.parse import urlparse
+        if urlparse(self.path).path != "/api/restore":
+            return self._json({"ok": False, "msg": "Unknown endpoint"}, 404)
+        if "json" not in (self.headers.get("Content-Type") or ""):
+            return self._json({"ok": False,
+                               "msg": "Send the file as Content-Type: application/json"}, 415)
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        try:
+            doc = json.loads(raw)
+        except Exception:
+            return self._json({"ok": False, "msg": "Not a valid settings file"}, 400)
+        dev = self.server.device
+        applied = 0
+        with dev.lock:
+            if "out" in doc:
+                dev.out.update({k: v for k, v in doc["out"].items() if k in dev.out})
+                applied += 1
+            if "ap" in doc:
+                for k in ("ssid", "ch", "hide"):
+                    if k in doc["ap"]: dev.ap[k] = doc["ap"][k]
+                applied += 1
+            for k in ("sta", "push", "arp", "base"):
+                if k in doc: applied += 1
+        return self._json({"ok": True, "applied": applied,
+                           "msg": "Restored, rebooting"})
+
     def do_GET(self):
         url = urlparse(self.path)
         q = {k: v[0] for k, v in parse_qs(url.query).items()}
@@ -342,6 +404,37 @@ class Handler(BaseHTTPRequestHandler):
                 dev.sta_ssid = ""
             return self._text("OK")
 
+        if url.path == "/api/history":
+            body = dev.history_blob()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if url.path == "/api/backup":
+            body = json.dumps({
+                "fw": "1.1.0",
+                "ap": {"ssid": dev.ap["ssid"], "pass": "", "ch": dev.ap["ch"],
+                       "hide": dev.ap["hide"]},
+                "sta": {"ssid": dev.sta_ssid, "pass": ""},
+                "out": dict(dev.out),
+                "push": {k: dev.push[k] for k in ("en", "host", "port", "mount")},
+                "arp": {"n": dev.arp["n"], "e": dev.arp["e"], "u": dev.arp["u"]},
+                "base": {"mode": dev.base["m"], "dur": dev.base["dur"],
+                         "acc": dev.base["acc"], "x": dev.base["x"],
+                         "y": dev.base["y"], "z": dev.base["z"]},
+            }, indent=1).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Disposition",
+                             'attachment; filename="rtk-base-settings.json"')
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if url.path == "/api/base":
             return self._api_base(q)
         if url.path == "/api/output":

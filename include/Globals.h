@@ -317,6 +317,16 @@ struct RtcmClientInfo {
   char     ip[16];
   uint32_t since;
   uint32_t sent;      // bytes pushed to this client
+  // Reported by the rover itself. NTRIP clients send a GGA sentence back up
+  // the same connection - the protocol carries it for network/VRS casters,
+  // and it is the only way this end learns whether the corrections landed.
+  bool     hasFix;    // a GGA has been received and parsed
+  uint8_t  fixQual;   // GGA field 6: 1 SPS, 2 DGPS, 4 RTK fixed, 5 RTK float
+  uint8_t  sats;
+  float    hdop;
+  double   lat, lon, alt;
+  float    baseline;  // metres from the broadcast station position, -1 unknown
+  uint32_t ggaAgeMs;
 };
 
 struct UdpClientInfo {

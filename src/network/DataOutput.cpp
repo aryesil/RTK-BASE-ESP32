@@ -3,6 +3,9 @@
 #include <lwip/sockets.h>
 #include <mbedtls/base64.h>
 #include <network/NtripPush.h>
+#include <gnss/GNSS_Core.h>
+#include <gnss/BaseConfig.h>
+#include <math.h>
 
 static WiFiServer* tcpServer = nullptr;
 static Preferences outPrefs;
@@ -26,6 +29,17 @@ struct TcpSlot {
   uint32_t   sent;
   uint16_t   reqLen;
   char       req[NTRIP_REQ_MAX];
+  // Rover state, learned from the GGA an NTRIP client sends back up the
+  // connection. Everything here stays zero for a raw TCP consumer and for a
+  // client that never reports.
+  char       gga[NMEA_BACK_MAX];
+  uint8_t    ggaLen;
+  bool       hasFix;
+  uint8_t    fixQual;
+  uint8_t    sats;
+  float      hdop;
+  double     rLat, rLon, rAlt;
+  uint32_t   ggaMs;
 };
 static TcpSlot slots[MAX_TCP_CLIENTS];
 
@@ -386,6 +400,15 @@ static void acceptNewClients() {
       slots[i].sent = 0;
       slots[i].reqLen = 0;
       slots[i].req[0] = '\0';
+      // Slots are reused, so the previous occupant's rover report has to go
+      // with it. Leaving it attributed this connection a fix it never claimed.
+      slots[i].ggaLen = 0;
+      slots[i].ggaMs = 0;
+      slots[i].hasFix = false;
+      slots[i].fixQual = 0;
+      slots[i].sats = 0;
+      slots[i].hdop = 0.0f;
+      slots[i].rLat = slots[i].rLon = slots[i].rAlt = 0.0;
       // acceptMode 2 skips the sniff entirely so raw clients start instantly.
       slots[i].mode = (outCfg.acceptMode == 2) ? CM_RAW : CM_SNIFF;
       placed = true;
@@ -396,6 +419,76 @@ static void acceptNewClients() {
   if (!placed) {
     nc.print("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
     nc.stop();
+  }
+}
+
+// --------------------------------------------------------------------------
+// Rover reports
+// --------------------------------------------------------------------------
+// An NTRIP client sends a GGA sentence back up the connection - the protocol
+// carries it so a network caster can pick the nearest base. Nothing on this
+// end needs it to serve the stream, but it is the only signal the base ever
+// gets about whether its corrections actually produced a fix, so it is parsed
+// rather than discarded.
+
+// ddmm.mmmm with a hemisphere character, the NMEA angle format.
+static double nmeaAngle(const char* v, const char* hemi) {
+  if (!v[0]) return 0.0;
+  double raw = atof(v);
+  double deg = floor(raw / 100.0);
+  double val = deg + (raw - deg * 100.0) / 60.0;
+  return (hemi[0] == 'S' || hemi[0] == 'W') ? -val : val;
+}
+
+static void parseRoverGga(TcpSlot &s) {
+  if (!isChecksumValid(s.gga)) return;
+  // Any talker: rovers report as $GN, $GP or occasionally something else.
+  if (strncmp(s.gga + 3, "GGA,", 4) != 0) return;
+
+  int commas[16], starIdx;
+  int cCount = nmeaIndexFields(s.gga, commas, 16, starIdx);
+  if (cCount < 9) return;
+
+  char lat[16], ns[4], lon[16], ew[4], q[8], nsat[8], hd[12], alt[16];
+  nmeaField(s.gga, commas, cCount, starIdx, 2, lat,  sizeof(lat));
+  nmeaField(s.gga, commas, cCount, starIdx, 3, ns,   sizeof(ns));
+  nmeaField(s.gga, commas, cCount, starIdx, 4, lon,  sizeof(lon));
+  nmeaField(s.gga, commas, cCount, starIdx, 5, ew,   sizeof(ew));
+  nmeaField(s.gga, commas, cCount, starIdx, 6, q,    sizeof(q));
+  nmeaField(s.gga, commas, cCount, starIdx, 7, nsat, sizeof(nsat));
+  nmeaField(s.gga, commas, cCount, starIdx, 8, hd,   sizeof(hd));
+  nmeaField(s.gga, commas, cCount, starIdx, 9, alt,  sizeof(alt));
+
+  s.fixQual = (q[0] >= '0' && q[0] <= '9') ? (uint8_t)(q[0] - '0') : 0;
+  s.sats    = (uint8_t)atoi(nsat);
+  s.hdop    = (float)atof(hd);
+  s.rLat    = nmeaAngle(lat, ns);
+  s.rLon    = nmeaAngle(lon, ew);
+  s.rAlt    = atof(alt);
+  s.ggaMs   = millis();
+  // A client can report while still searching; the position is only meaningful
+  // once it has a fix of some kind.
+  s.hasFix  = s.fixQual > 0 && (s.rLat != 0.0 || s.rLon != 0.0);
+}
+
+// Assembles lines out of whatever the client sends, keeping only plausible
+// NMEA. Anything else is dropped on the floor exactly as before.
+static void readRoverReports(TcpSlot &s) {
+  while (s.sock.available()) {
+    char c = (char)s.sock.read();
+    if (c == '$') {
+      s.ggaLen = 0;
+      s.gga[s.ggaLen++] = c;
+    } else if (c == '\n' || c == '\r') {
+      if (s.ggaLen > 6 && s.gga[0] == '$') {
+        s.gga[s.ggaLen] = '\0';
+        parseRoverGga(s);
+      }
+      s.ggaLen = 0;
+    } else if (s.ggaLen && c >= 32 && c <= 126) {
+      if (s.ggaLen < NMEA_BACK_MAX - 1) s.gga[s.ggaLen++] = c;
+      else s.ggaLen = 0;              // not a sentence, resync on the next '$'
+    }
   }
 }
 
@@ -411,8 +504,7 @@ static void serviceHandshakes() {
         continue;
       }
       if (s.mode != CM_SNIFF) {
-        // Drain anything a streaming client sends; NTRIP clients push GGA.
-        while (s.sock.available()) s.sock.read();
+        readRoverReports(s);
         continue;
       }
 
@@ -675,6 +767,28 @@ int snapshotTcpClients(RtcmClientInfo* out, int max) {
       strlcpy(out[n].ip, slots[i].sock.remoteIP().toString().c_str(), sizeof(out[n].ip));
       out[n].since = slots[i].since;
       out[n].sent = slots[i].sent;
+
+      uint32_t age = slots[i].ggaMs ? millis() - slots[i].ggaMs : 0;
+      bool fresh = slots[i].ggaMs && age < ROVER_GGA_STALE_MS;
+      out[n].hasFix  = fresh && slots[i].hasFix;
+      out[n].fixQual = fresh ? slots[i].fixQual : 0;
+      out[n].sats    = fresh ? slots[i].sats : 0;
+      out[n].hdop    = fresh ? slots[i].hdop : 0.0f;
+      out[n].lat     = slots[i].rLat;
+      out[n].lon     = slots[i].rLon;
+      out[n].alt     = slots[i].rAlt;
+      out[n].ggaAgeMs = slots[i].ggaMs ? age : 0xFFFFFFFF;
+      out[n].baseline = -1.0f;
+      // Straight-line ground distance to the coordinate actually being
+      // broadcast, which is what decides whether the rover is inside a
+      // sensible baseline for this base.
+      if (out[n].hasFix && bcast.valid) {
+        double bLat, bLon, bHgt;
+        ecefToLla(bcast.x, bcast.y, bcast.z, bLat, bLon, bHgt);
+        double dN = (slots[i].rLat - bLat) * 111320.0;
+        double dE = (slots[i].rLon - bLon) * 111320.0 * cos(bLat * M_PI / 180.0);
+        out[n].baseline = (float)sqrt(dN * dN + dE * dE);
+      }
       n++;
     }
     xSemaphoreGive(tcpMutex);

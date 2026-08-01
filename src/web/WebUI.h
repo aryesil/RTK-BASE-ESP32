@@ -34,7 +34,7 @@ a{color:inherit;text-decoration:none}
 
 /* ---- nav ---- */
 nav{display:flex;background:#fff;padding:0 14px;gap:2px;flex-wrap:wrap}
-nav a{flex:1;min-width:110px;text-align:center;background:var(--or);color:#fff;font-weight:bold;padding:7px 4px;font-size:13px;border-radius:3px 3px 0 0}
+nav a{flex:1;min-width:92px;text-align:center;background:var(--or);color:#fff;font-weight:bold;padding:7px 2px;font-size:12.5px;border-radius:3px 3px 0 0;white-space:nowrap}
 nav a:hover{background:var(--or2)}
 nav a.on{background:#b9660a}
 .crumb{padding:5px 16px;color:var(--mu);font-size:12px}
@@ -94,6 +94,14 @@ canvas{max-width:100%;display:block;margin:0 auto}
 .legend{display:flex;gap:12px;flex-wrap:wrap;justify-content:center;font-size:11.5px;margin-top:6px}
 .legend span{display:flex;align-items:center;gap:4px}
 .sw{width:10px;height:10px;border-radius:2px}
+.hsum{display:flex;flex-wrap:wrap;gap:10px 26px;font-size:12.5px}
+.hsum div{min-width:130px}
+.hsum b{display:block;font-weight:normal;color:var(--mu);font-size:11px;
+        text-transform:uppercase;letter-spacing:.3px}
+.hstrip{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+.hstrip .hlab{width:62px;flex:none;font-size:11px;color:var(--mu);text-align:right}
+.hstrip canvas{flex:1;margin:0}
+#hAxis{margin-left:70px;width:calc(100% - 70px)}
 /* Downlink indicator. The skeleton is built once and only its attributes are
    refreshed, so the sweep never restarts on a telemetry update. Every tracked
    constellation gets the same green link, matching the receiver convention:
@@ -127,8 +135,10 @@ canvas{max-width:100%;display:block;margin:0 auto}
 .ionowrap{flex:1;display:flex;flex-direction:column;justify-content:center}
 .pill{display:inline-block;padding:1px 7px;border-radius:9px;font-size:11px;font-weight:bold}
 .pill.n{background:#e7f0fa;color:#2f6fad}.pill.r{background:#eef1f4;color:#5c7089}
+.pill.g{background:#e3f4e8;color:#1f7a45}
 code{background:#f2f5f8;padding:1px 5px;border-radius:3px;font-size:12px}
-@media(max-width:700px){.hstat{padding-top:0}nav a{min-width:80px;font-size:12px}}
+@media(max-width:860px){nav a{min-width:78px;font-size:11.5px}}
+@media(max-width:700px){.hstat{padding-top:0}nav a{min-width:70px;font-size:11px}}
 </style>
 </head>
 <body>
@@ -180,6 +190,7 @@ code{background:#f2f5f8;padding:1px 5px;border-radius:3px;font-size:12px}
   <a href="#base" data-p="base">Base Mode</a>
   <a href="#output" data-p="output">Data Output</a>
   <a href="#network" data-p="network">Network</a>
+  <a href="#history" data-p="history">History</a>
   <a href="#terminal" data-p="terminal">Terminal</a>
   <a href="#admin" data-p="admin">Admin</a>
 </nav>
@@ -726,7 +737,8 @@ code{background:#f2f5f8;padding:1px 5px;border-radius:3px;font-size:12px}
       <h3>Connected Consumers</h3>
       <div class="scroll">
         <table id="clTable">
-          <thead><tr><th>Address</th><th>Transport</th><th>Connected</th><th>Sent</th></tr></thead>
+          <thead><tr><th>Address</th><th>Transport</th><th>Connected</th><th>Sent</th>
+            <th>Rover fix</th><th>Baseline</th><th>Reported</th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
@@ -813,6 +825,104 @@ code{background:#f2f5f8;padding:1px 5px;border-radius:3px;font-size:12px}
 </section>
 
 <!-- ================= TERMINAL ================= -->
+<!-- ================= HISTORY ================= -->
+<section class="page" id="p-history">
+  <div class="box">
+    <h3>Last 12 Hours</h3>
+    <div class="hsum" id="hsSummary"></div>
+    <div class="note">
+      Sampled every 30 seconds since the device booted, held in memory only:
+      a reboot starts the window again. Move the pointer across any chart to
+      read every value at that moment.
+    </div>
+  </div>
+
+  <div class="box">
+    <h3>Where the receiver thinks it is</h3>
+    <canvas id="hPos" width="900" height="210"></canvas>
+    <div class="legend">
+      <span><i class="sw" style="background:#2f6fad"></i>North</span>
+      <span><i class="sw" style="background:#c0392b"></i>East</span>
+      <span><i class="sw" style="background:#2f8f47"></i>Up</span>
+    </div>
+    <div class="note">
+      Movement of the receiver's own live solution, in centimetres from where it
+      was when the window opened &mdash; <b id="hRefTxt">--</b>. The station is
+      not moving, so everything here is measurement error. A flat trace with
+      small noise is healthy; a slow ramp over hours is normal for a standalone
+      solution and does not affect the fixed coordinate being broadcast. A sharp
+      step means something actually changed: the antenna was touched, or the
+      receiver switched modes.
+    </div>
+  </div>
+
+  <div class="cols">
+    <div class="box">
+      <h3>Satellites in the solution</h3>
+      <canvas id="hSats" width="440" height="150"></canvas>
+      <div class="legend">
+        <span><i class="sw" style="background:#2f6fad"></i>Used in the fix</span>
+        <span><i class="sw" style="background:#9aa8b5"></i>Tracked</span>
+      </div>
+      <div class="note">
+        The same two figures as the header, counted from GSV and GSA. Fewer
+        satellites means weaker geometry, and a daily pattern usually means
+        something is blocking part of the sky.<br><br>
+        <b>Both are floors, not exact counts.</b> An NMEA GSA sentence carries at
+        most twelve satellites and this module sends one per constellation, so
+        GPS and BeiDou sit at twelve whenever the receiver is actually using
+        more. The receiver's own figure in GGA runs higher still &mdash; higher
+        than the number of satellites GSV reports as tracked &mdash; so on this
+        dual-frequency module it is counting signals rather than satellites, and
+        is not plotted here.
+      </div>
+    </div>
+    <div class="box">
+      <h3>Signal strength (mean C/N0)</h3>
+      <canvas id="hCn0" width="440" height="150"></canvas>
+      <div class="note">
+        Averaged over every signal being tracked, weak low-elevation ones
+        included, so the absolute number is lower than a single satellite's and
+        is not meant to be compared against a fixed threshold. The dashed line
+        is this window's own median: what matters is the trend away from it. A
+        slow decline over days is the classic sign of a connector or cable
+        letting water in.
+      </div>
+    </div>
+  </div>
+
+  <div class="cols">
+    <div class="box">
+      <h3>Position dilution (HDOP)</h3>
+      <canvas id="hHdop" width="440" height="150"></canvas>
+      <div class="note">Lower is better; under 1.0 is good geometry.</div>
+    </div>
+    <div class="box">
+      <h3>Correction output</h3>
+      <canvas id="hBps" width="440" height="150"></canvas>
+      <div class="note">
+        RTCM bytes per second leaving the device. A drop to zero is an outage
+        rovers would have felt.
+      </div>
+    </div>
+  </div>
+
+  <div class="box">
+    <h3>Fix quality and interference over time</h3>
+    <div class="hstrip"><span class="hlab">Fix</span><canvas id="hFix" width="900" height="26"></canvas></div>
+    <div class="hstrip"><span class="hlab">L1 band</span><canvas id="hJ1" width="900" height="26"></canvas></div>
+    <div class="hstrip"><span class="hlab">L5 band</span><canvas id="hJ5" width="900" height="26"></canvas></div>
+    <canvas id="hAxis" width="900" height="22"></canvas>
+    <div class="legend" id="hStripLegend"></div>
+    <div class="note">
+      Each band is one continuous strip of colour, so an outage or a burst of
+      interference is visible as a block rather than as a spike you have to
+      catch. Interference showing up at the same time each day points at
+      something on a timer nearby rather than at the receiver.
+    </div>
+  </div>
+</section>
+
 <section class="page" id="p-terminal">
   <div class="box">
     <h3>Serial Port Terminal</h3>
@@ -862,6 +972,40 @@ code{background:#f2f5f8;padding:1px 5px;border-radius:3px;font-size:12px}
       <div class="msg" id="aMsg"></div>
     </div>
   </div>
+
+  <div class="box">
+    <h3>Settings Backup</h3>
+    <div class="cols">
+      <div>
+        <button class="btn" onclick="downloadBackup()">Download settings as a file</button>
+        <div class="note" style="margin-top:8px">
+          Saves everything this device holds: access point and station
+          credentials, all four output transports, the NTRIP caster and push
+          settings, and the antenna reference point offset. The station
+          coordinate and survey settings are included as well &mdash; those live
+          in the module's own memory, and this is the only copy on the ESP32
+          side.
+        </div>
+      </div>
+      <div>
+        <label class="f">Restore from a backup file</label>
+        <input type="file" id="aRestoreFile" accept=".json,application/json">
+        <button class="btn r" onclick="uploadBackup()">Restore these settings</button>
+        <div class="msg" id="aBkMsg"></div>
+        <div class="note" style="margin-top:8px">
+          Applies every field present in the file and reboots. Anything the file
+          omits is left alone. The station coordinate is written back to the
+          module, so restoring a backup taken at a different site will move the
+          base &mdash; check the file before applying it.
+        </div>
+      </div>
+    </div>
+    <div class="note">
+      <b>The file contains passwords in plain text</b> &mdash; the WiFi key, the
+      NTRIP caster password and the push password. That is what makes it a
+      usable backup, but keep it somewhere you would keep those passwords.
+    </div>
+  </div>
 </section>
 
 </main>
@@ -908,10 +1052,55 @@ function route(){
   document.getElementById('crumb').textContent =
     ({overview:'Overview', gnss:'GNSS > Satellites and Signals', base:'Base Mode > Position Mode',
       output:'Data Output > RTCM Distribution', network:'Network > Interfaces',
+      history:'History > Last 12 Hours',
       terminal:'Terminal', admin:'Admin'})[p];
+  if(p === 'history') loadHistory(true);
   if(D) render();
 }
 window.addEventListener('hashchange', route);
+
+/* A canvas draws into a bitmap sized by its width/height attributes. On a
+   HiDPI screen that bitmap is stretched to twice as many physical pixels, so
+   every label rendered into it goes soft - measured here as devicePixelRatio 2
+   with a 1:1 backing store, and worse again on the flex-stretched strips. Size
+   the buffer in device pixels, pin the CSS box to the layout size, and scale
+   the context once; every drawing routine below then keeps working in CSS
+   pixels without knowing about any of this. */
+function hidpi(cv){
+  if(!cv) return null;
+  const dpr = Math.min(window.devicePixelRatio || 1, 3);
+  // Design size from the markup, captured once: re-reading it after the buffer
+  // has been resized would compound on every draw.
+  if(!cv.__w){ cv.__w = cv.width; cv.__h = cv.height; }
+  const r = cv.getBoundingClientRect();
+  // A hidden page measures zero, and flex-stretched canvases measure wider
+  // than the markup says.
+  const W = r.width  > 10 ? Math.round(r.width)  : cv.__w;
+  const H = r.height >  4 ? Math.round(r.height) : cv.__h;
+  if(cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)){
+    cv.width  = Math.round(W * dpr);
+    cv.height = Math.round(H * dpr);
+    cv.style.width  = W + 'px';
+    cv.style.height = H + 'px';
+  }
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return {ctx, W, H};
+}
+
+// Pinning the CSS box stops a canvas growing back when the window does, so the
+// pins are dropped on resize and the next draw re-measures.
+let hidpiTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(hidpiTimer);
+  hidpiTimer = setTimeout(() => {
+    document.querySelectorAll('canvas').forEach(c => {
+      c.style.width = ''; c.style.height = '';
+    });
+    if(typeof D !== 'undefined' && D) render();
+    if(page === 'history') drawHistory();
+  }, 180);
+});
 
 /* ---------------- helpers ---------------- */
 function $(id){ return document.getElementById(id); }
@@ -1034,6 +1223,9 @@ function render(){
   else if(page === 'output') renderOutput();
   else if(page === 'network') renderNetwork();
   else if(page === 'admin') renderAdmin();
+  // Fetched rather than pushed: the ring buffer only advances every 30 s, so
+  // there is nothing to gain from putting it on the 1 Hz telemetry message.
+  else if(page === 'history') loadHistory(false);
 }
 
 // NetState: 0 AP only, 1 connecting, 2 station up, 3 reconnecting.
@@ -1313,8 +1505,8 @@ function renderBandTable(){
 }
 
 function drawSky(){
-  const cv = $('sky'), ctx = cv.getContext('2d');
-  const W = cv.width, H = cv.height, cx = W/2, cy = H/2, R = cx - 30;
+  const hp = hidpi($('sky')); if(!hp) return;
+  const {ctx, W, H} = hp, cx = W/2, cy = H/2, R = cx - 30;
   ctx.clearRect(0, 0, W, H);
 
   ctx.strokeStyle = '#7ba7d4'; ctx.lineWidth = 1.4;
@@ -1371,8 +1563,8 @@ function buildSysSelect(){
 }
 
 function drawCn0(){
-  const cv = $('cn0'), ctx = cv.getContext('2d');
-  const W = cv.width, H = cv.height;
+  const hp = hidpi($('cn0')); if(!hp) return;
+  const {ctx, W, H} = hp;
   ctx.clearRect(0, 0, W, H);
   if(!D) return;
 
@@ -1678,6 +1870,254 @@ function confirmRestore(){
   if(confirm('Restore all $PQTM parameters in the module to factory defaults?')) baseApi('restore');
 }
 
+/* ---------------- History: last 12 hours ---------------- */
+/* The device serves its ring buffer as fixed-width binary rather than JSON:
+   23 kB of records would have cost roughly 58 kB of text and the heap to build
+   it, for something the browser can read directly. Offsets mirror
+   src/system/History.cpp. */
+let hist = null, histBusy = false, histLastFetch = 0;
+
+const FIXCOL  = {0:'#c0392b', 1:'#7f9ab5', 2:'#4a90c4', 4:'#2f8f47', 5:'#e8a33d'};
+const FIXTXT  = {0:'no fix', 1:'single', 2:'DGPS', 4:'RTK fixed', 5:'RTK float'};
+const JAMCOL  = {0:'#dde4ea', 1:'#2f8f47', 2:'#e8a33d', 3:'#c0392b'};
+const JAMTXT  = {0:'unknown', 1:'clean', 2:'warning', 3:'critical'};
+
+function parseHistory(buf){
+  const d = new DataView(buf);
+  if(d.getUint32(0, true) !== 0x484B5452) return null;
+  const count = d.getUint16(4, true), iv = d.getUint16(6, true);
+  const head = d.getUint16(8, true), filled = d.getUint16(10, true);
+  const up = d.getUint32(12, true);
+  const ref = {lat: d.getFloat64(24, true), lon: d.getFloat64(32, true),
+               alt: d.getFloat64(40, true)};
+  // Oldest first, so index maps straight to time.
+  const start = filled < count ? 0 : head;
+  const rows = [];
+  for(let k = 0; k < filled; k++){
+    const o = 48 + ((start + k) % count) * 16;
+    const v = d.getUint8(o + 14);
+    if(!v) continue;
+    const f = d.getUint8(o + 4), io = d.getUint8(o + 5), hd = d.getUint16(o + 2, true);
+    rows.push({
+      sats: d.getUint8(o), cn0: d.getUint8(o + 1),
+      hdop: hd === 0xFFFF ? null : hd / 100,
+      fix: f & 0x0F, j1: (f >> 4) & 3, j5: (f >> 6) & 3,
+      iono: io === 255 ? null : io,
+      tracked: d.getUint8(o + 15),
+      n: v === 1 ? d.getInt16(o + 6, true) : null,
+      e: v === 1 ? d.getInt16(o + 8, true) : null,
+      u: v === 1 ? d.getInt16(o + 10, true) : null,
+      bps: d.getUint16(o + 12, true)
+    });
+  }
+  // Age in seconds of each sample, counting back from the newest.
+  rows.forEach((r, i) => r.age = (rows.length - 1 - i) * iv);
+  return {iv, up, ref, rows};
+}
+
+function loadHistory(force){
+  if(histBusy) return;
+  // The window only advances every 30 s; refetching faster is wasted work.
+  if(!force && Date.now() - histLastFetch < 30000) return;
+  histBusy = true;
+  fetch('/api/history').then(r => r.arrayBuffer()).then(b => {
+    hist = parseHistory(b);
+    histLastFetch = Date.now();
+    drawHistory();
+  }).catch(() => {}).finally(() => { histBusy = false; });
+}
+
+/* Shared plot frame: a time axis running right-to-left in hours, horizontal
+   gridlines, and the value axis labelled in the series' own unit. */
+function hFrame(ctx, W, H, lo, hi, unit, span){
+  const L = 46, R = 10, T = 20, B = 20;   // T leaves room for the unit label
+  const pw = W - L - R, ph = H - T - B;
+  ctx.clearRect(0, 0, W, H);
+  ctx.font = '10px Arial'; ctx.strokeStyle = '#eef2f6';
+  ctx.fillStyle = '#8a99a8'; ctx.textAlign = 'right';
+  for(let i = 0; i <= 4; i++){
+    const y = T + ph - i / 4 * ph, v = lo + (hi - lo) * i / 4;
+    ctx.beginPath(); ctx.moveTo(L, y); ctx.lineTo(W - R, y); ctx.stroke();
+    ctx.fillText(Math.abs(hi - lo) < 4 ? v.toFixed(1) : Math.round(v), L - 5, y + 3);
+  }
+  // Left-aligned in the margin above the scale, so it never lands on the
+  // topmost gridline value.
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#8a99a8';
+  ctx.fillText(unit, 2, 10);
+  // Hour marks, oldest on the left.
+  ctx.textAlign = 'center';
+  const hours = Math.max(1, Math.ceil(span / 3600));
+  const stepH = hours > 8 ? 2 : 1;
+  for(let h = 0; h <= hours; h += stepH){
+    const x = L + pw - (h * 3600 / Math.max(span, 1)) * pw;
+    if(x < L - 1) continue;
+    ctx.strokeStyle = '#f4f7fa';
+    ctx.beginPath(); ctx.moveTo(x, T); ctx.lineTo(x, T + ph); ctx.stroke();
+    ctx.fillStyle = '#8a99a8';
+    ctx.fillText(h === 0 ? 'now' : '-' + h + 'h', x, H - 6);
+  }
+  return {L, R, T, B, pw, ph};
+}
+
+function hLine(ctx, fr, rows, span, pick, lo, hi, col, fill){
+  const pts = [];
+  rows.forEach(r => {
+    const v = pick(r);
+    if(v === null || v === undefined) { pts.push(null); return; }
+    pts.push({x: fr.L + fr.pw - (r.age / Math.max(span, 1)) * fr.pw,
+              y: fr.T + fr.ph - (v - lo) / Math.max(hi - lo, 1e-6) * fr.ph});
+  });
+  if(fill){
+    ctx.fillStyle = fill; ctx.beginPath(); let open = false;
+    pts.forEach(p => {
+      if(!p){ if(open){ ctx.lineTo(ctx.__lx, fr.T + fr.ph); ctx.closePath(); ctx.fill(); open = false; } return; }
+      if(!open){ ctx.beginPath(); ctx.moveTo(p.x, fr.T + fr.ph); open = true; }
+      ctx.lineTo(p.x, p.y); ctx.__lx = p.x;
+    });
+    if(open){ ctx.lineTo(ctx.__lx, fr.T + fr.ph); ctx.closePath(); ctx.fill(); }
+  }
+  ctx.strokeStyle = col; ctx.lineWidth = 1.6; ctx.lineJoin = 'round';
+  ctx.beginPath(); let pen = false;
+  pts.forEach(p => {
+    if(!p){ pen = false; return; }
+    if(!pen){ ctx.moveTo(p.x, p.y); pen = true; } else ctx.lineTo(p.x, p.y);
+  });
+  ctx.stroke();
+}
+
+function hRange(rows, picks, pad){
+  let lo = Infinity, hi = -Infinity;
+  rows.forEach(r => picks.forEach(p => {
+    const v = p(r);
+    if(v === null || v === undefined) return;
+    if(v < lo) lo = v; if(v > hi) hi = v;
+  }));
+  if(lo === Infinity) return [0, 1];
+  if(hi - lo < pad){ const m = (lo + hi) / 2; lo = m - pad / 2; hi = m + pad / 2; }
+  const m = (hi - lo) * 0.12;
+  return [lo - m, hi + m];
+}
+
+function hStrip(id, rows, span, pick, palette){
+  const hp = hidpi($(id)); if(!hp) return;
+  const {ctx, W, H} = hp;
+  ctx.clearRect(0, 0, W, H);
+  if(!rows.length) return;
+  // One rectangle per sample, widened slightly so rounding never leaves gaps.
+  const w = Math.max(1, W / rows.length + 0.6);
+  rows.forEach(r => {
+    const x = W - (r.age / Math.max(span, 1)) * W;
+    ctx.fillStyle = palette[pick(r)] || '#dde4ea';
+    ctx.fillRect(x - w, 3, w, H - 6);
+  });
+}
+
+function drawHistory(){
+  if(!hist || !hist.rows.length){
+    $('hsSummary').innerHTML =
+      '<div style="color:#9aa8b5">Collecting &mdash; the first sample lands 30 seconds after boot.</div>';
+    return;
+  }
+  const rows = hist.rows, span = Math.max(rows[0].age, hist.iv);
+  const last = rows[rows.length - 1];
+  const cover = span / 3600;
+
+  const fixPct = rows.filter(r => r.fix === 4).length / rows.length * 100;
+  const cn0s = rows.map(r => r.cn0).filter(v => v > 0);
+  const pos = rows.filter(r => r.n !== null);
+  let spread = 0;
+  if(pos.length){
+    const mn = pos.reduce((a, r) => a + r.n, 0) / pos.length;
+    const me = pos.reduce((a, r) => a + r.e, 0) / pos.length;
+    pos.forEach(r => { spread = Math.max(spread, Math.hypot(r.n - mn, r.e - me)); });
+  }
+  $('hsSummary').innerHTML = [
+    ['Window covered', cover < 1 ? Math.round(span / 60) + ' min' : cover.toFixed(1) + ' h'],
+    ['Samples', rows.length + ' of 1440'],
+    ['Horizontal spread', pos.length ? spread.toFixed(0) + ' cm' : '&ndash;'],
+    ['Mean C/N0 now', last.cn0 ? last.cn0 + ' dB-Hz' : '&ndash;'],
+    ['Lowest C/N0 seen', cn0s.length ? Math.min.apply(null, cn0s) + ' dB-Hz' : '&ndash;'],
+    ['Time with RTK fix', fixPct.toFixed(0) + '%'],
+    ['Output stopped', rows.filter(r => r.bps === 0).length * hist.iv + ' s']
+  ].map(x => `<div><b>${x[0]}</b>${x[1]}</div>`).join('');
+
+  txt('hRefTxt', hist.ref.lat ? hist.ref.lat.toFixed(7) + ', ' + hist.ref.lon.toFixed(7)
+                              : 'no reference yet');
+
+  // Position: one frame, three series, shared scale so they stay comparable.
+  const ph_ = hidpi($('hPos')); if(!ph_) return;
+  const pc = ph_.ctx;
+  const [plo, phi] = hRange(rows, [r => r.n, r => r.e, r => r.u], 20);
+  const pf = hFrame(pc, ph_.W, ph_.H, plo, phi, 'cm', span);
+  hLine(pc, pf, rows, span, r => r.n, plo, phi, '#2f6fad');
+  hLine(pc, pf, rows, span, r => r.e, plo, phi, '#c0392b');
+  hLine(pc, pf, rows, span, r => r.u, plo, phi, '#2f8f47');
+
+  const sh_ = hidpi($('hSats')); if(!sh_) return;
+  const sc = sh_.ctx;
+  const [slo, shi] = hRange(rows, [r => r.sats, r => r.tracked], 6);
+  const sf = hFrame(sc, sh_.W, sh_.H, Math.max(0, slo), shi, 'sv', span);
+  hLine(sc, sf, rows, span, r => r.tracked, Math.max(0, slo), shi, '#9aa8b5');
+  hLine(sc, sf, rows, span, r => r.sats, Math.max(0, slo), shi, '#2f6fad', 'rgba(47,111,173,.13)');
+
+  const ch_ = hidpi($('hCn0')); if(!ch_) return;
+  const cc = ch_.ctx;
+  const [clo, chi] = hRange(rows, [r => r.cn0 || null], 6);
+  const cf = hFrame(cc, ch_.W, ch_.H, clo, chi, 'dB-Hz', span);
+  // The window's own median, not a fixed threshold. This average covers every
+  // tracked signal including weak low-elevation ones, so its absolute value
+  // says little; what matters is whether today sits below the recent normal.
+  if(cn0s.length){
+    const srt = cn0s.slice().sort((a, b) => a - b);
+    const med = srt[srt.length >> 1];
+    if(med > clo && med < chi){
+      const y = cf.T + cf.ph - (med - clo) / (chi - clo) * cf.ph;
+      cc.strokeStyle = '#c2ccd6'; cc.setLineDash([4, 3]);
+      cc.beginPath(); cc.moveTo(cf.L, y); cc.lineTo(cf.L + cf.pw, y); cc.stroke();
+      cc.setLineDash([]);
+      cc.fillStyle = '#8a99a8'; cc.font = '9px Arial'; cc.textAlign = 'left';
+      cc.fillText('median ' + med, cf.L + 3, y - 3);
+    }
+  }
+  hLine(cc, cf, rows, span, r => r.cn0 || null, clo, chi, '#2f8f47', 'rgba(47,143,71,.13)');
+
+  const hh_ = hidpi($('hHdop')); if(!hh_) return;
+  const hc = hh_.ctx;
+  const [hlo, hhi] = hRange(rows, [r => r.hdop], 0.5);
+  const hf = hFrame(hc, hh_.W, hh_.H, Math.max(0, hlo), hhi, 'HDOP', span);
+  hLine(hc, hf, rows, span, r => r.hdop, Math.max(0, hlo), hhi, '#8e5bd6');
+
+  const bh_ = hidpi($('hBps')); if(!bh_) return;
+  const bc = bh_.ctx;
+  const [blo, bhi] = hRange(rows, [r => r.bps], 200);
+  const bf = hFrame(bc, bh_.W, bh_.H, 0, Math.max(bhi, 100), 'B/s', span);
+  hLine(bc, bf, rows, span, r => r.bps, 0, Math.max(bhi, 100), '#ef9421', 'rgba(239,148,33,.15)');
+
+  hStrip('hFix', rows, span, r => r.fix, FIXCOL);
+  hStrip('hJ1',  rows, span, r => r.j1,  JAMCOL);
+  hStrip('hJ5',  rows, span, r => r.j5,  JAMCOL);
+
+  const ah_ = hidpi($('hAxis'));
+  if(ah_){
+    const ac = ah_.ctx;
+    ac.clearRect(0, 0, ah_.W, ah_.H);
+    ac.font = '10px Arial'; ac.fillStyle = '#8a99a8'; ac.textAlign = 'center';
+    const hours = Math.max(1, Math.ceil(span / 3600)), step = hours > 8 ? 2 : 1;
+    for(let h = 0; h <= hours; h += step){
+      const x = ah_.W - (h * 3600 / span) * ah_.W;
+      if(x < 0) continue;
+      ac.fillText(h === 0 ? 'now' : '-' + h + 'h', Math.min(x, ah_.W - 12), 12);
+    }
+  }
+
+  const seen = k => [...new Set(rows.map(r => r[k]))];
+  $('hStripLegend').innerHTML =
+    seen('fix').sort().map(v => `<span><i class="sw" style="background:${FIXCOL[v] || '#dde4ea'}"></i>${FIXTXT[v] || 'q' + v}</span>`).join('') +
+    [...new Set(seen('j1').concat(seen('j5')))].sort().map(v =>
+      `<span><i class="sw" style="background:${JAMCOL[v]}"></i>${JAMTXT[v]}</span>`).join('');
+}
+
 /* ---------------- position scatter (no tiles, no internet) ---------------- */
 let scRef = null;
 function pushScatter(){
@@ -1694,9 +2134,8 @@ function pushScatter(){
 }
 
 function drawScatter(){
-  const cv = $('scatter'); if(!cv) return;
-  const ctx = cv.getContext('2d');
-  const W = cv.width, H = cv.height, cx = W/2, cy = H/2;
+  const hp = hidpi($('scatter')); if(!hp) return;
+  const {ctx, W, H} = hp, cx = W/2, cy = H/2;
   ctx.clearRect(0, 0, W, H);
 
   if(!scatter.length){
@@ -1792,9 +2231,8 @@ function ionoColour(d, span){
 }
 
 function drawIono(){
-  const cv = $('iono'); if(!cv) return;
-  const ctx = cv.getContext('2d');
-  const W = cv.width, H = cv.height;
+  const hp = hidpi($('iono')); if(!hp) return;
+  const {ctx, W, H} = hp;
   ctx.clearRect(0, 0, W, H);
 
   const arcs = (D.io || []).filter(a => a[2] > 0 && a[6] > 0 && (a[7] || a[8]));
@@ -1903,6 +2341,43 @@ function bytes(n){
 }
 function apAddr(){ return D.ap; }
 
+function downloadBackup(){
+  // Straight to the endpoint rather than through fetch: the response carries
+  // Content-Disposition, so the browser handles naming and saving.
+  const a = document.createElement('a');
+  a.href = '/api/backup';
+  a.download = 'rtk-base-settings.json';
+  document.body.appendChild(a); a.click(); a.remove();
+  showMsg('aBkMsg', 'Settings file requested.', true);
+}
+
+function uploadBackup(){
+  const f = $('aRestoreFile').files[0];
+  if(!f){ showMsg('aBkMsg', 'Pick a backup file first.', false); return; }
+  const r = new FileReader();
+  r.onload = () => {
+    // Explicit content type: an urlencoded body would be parsed away as
+    // request parameters and never reach the handler.
+    fetch('/api/restore', {method: 'POST',
+                           headers: {'Content-Type': 'application/json'},
+                           body: r.result})
+      .then(x => x.json())
+      .then(j => showMsg('aBkMsg', j.ok
+        ? `Restored ${j.applied} section(s). Rebooting; reconnect in a few seconds.`
+        : (j.msg || 'Rejected.'), !!j.ok))
+      // The device reboots as it answers, so a dropped connection here is the
+      // expected case rather than a failure.
+      .catch(() => showMsg('aBkMsg', 'Sent; the device is rebooting.', true));
+  };
+  r.readAsText(f);
+}
+
+// GGA field 6. Only 4 means the corrections were used and resolved; 5 means
+// they were used but the ambiguities are still float.
+const FIXNAME = {0:'no fix', 1:'single', 2:'DGPS', 3:'PPS', 4:'RTK fixed',
+                 5:'RTK float', 6:'dead reckoning', 7:'manual', 8:'simulated'};
+const FIXCLS  = {0:'r', 1:'r', 2:'n', 4:'g', 5:'n'};
+
 function renderOutput(){
   const o = D.out;
   const udpMode = [];
@@ -1941,15 +2416,28 @@ function renderOutput(){
     $('oUsbBaud').value = String(o.usbBaud);
   }
 
-  const cl = D.cl.map(c =>
-    `<tr><td>${esc(c[0])}</td><td><span class="pill ${c[1] === 'ntrip' ? 'n' : 'r'}">${c[1].toUpperCase()}</span></td>
-     <td>${dur(c[2])}</td><td>${bytes(c[3])}</td></tr>`);
+  const cl = D.cl.map(c => {
+    const age = c[8];
+    const fix = age < 0 ? '<span style="color:#9aa8b5">not reported</span>'
+              : `<span class="pill ${FIXCLS[c[4]] || 'r'}">${FIXNAME[c[4]] || 'no fix'}</span>`
+                + (c[5] ? ` <span style="color:#6c7f93">${c[5]} sv` +
+                          (c[6] ? `, HDOP ${c[6].toFixed(2)}` : '') + '</span>' : '');
+    const bl = c[7] < 0 ? '&ndash;'
+             : c[7] < 1000 ? c[7].toFixed(1) + ' m' : (c[7] / 1000).toFixed(2) + ' km';
+    const rep = age < 0 ? '&ndash;' : age < 2 ? 'now' : age + ' s ago';
+    return `<tr><td>${esc(c[0])}</td><td><span class="pill ${c[1] === 'ntrip' ? 'n' : 'r'}">${c[1].toUpperCase()}</span></td>
+     <td>${dur(c[2])}</td><td>${bytes(c[3])}</td><td>${fix}</td><td>${bl}</td><td>${rep}</td></tr>`;
+  });
   const ul = D.ul.map(c =>
     `<tr><td>${esc(c[0])}:${c[1]}</td><td><span class="pill n">UDP</span></td>
-     <td>${dur(c[2])}</td><td>${bytes(c[3])}</td></tr>`);
+     <td>${dur(c[2])}</td><td>${bytes(c[3])}</td>
+     <td colspan="3" style="color:#9aa8b5">no back channel</td></tr>`);
   $('clTable').tBodies[0].innerHTML = cl.concat(ul).join('') ||
-    '<tr><td colspan="4" style="color:#9aa8b5">No consumers connected</td></tr>';
-  txt('clNote', `${D.tcp} TCP/NTRIP and ${D.udp} UDP consumers.`);
+    '<tr><td colspan="7" style="color:#9aa8b5">No consumers connected</td></tr>';
+  const fixed = D.cl.filter(c => c[4] === 4).length;
+  const reporting = D.cl.filter(c => c[8] >= 0).length;
+  txt('clNote', `${D.tcp} TCP/NTRIP and ${D.udp} UDP consumers` +
+      (reporting ? `; ${reporting} reporting, ${fixed} with an RTK fix.` : '.'));
 
   renderPush();
 
@@ -1987,9 +2475,8 @@ function saveOutput(){
 }
 
 function drawCnEl(){
-  const cv = $('cnel'); if(!cv) return;
-  const ctx = cv.getContext('2d');
-  const W = cv.width, H = cv.height, L = 38, B = 34, T = 10, R = 12;
+  const hp = hidpi($('cnel')); if(!hp) return;
+  const {ctx, W, H} = hp, L = 38, B = 34, T = 10, R = 12;
   const pw = W - L - R, ph = H - B - T;
   ctx.clearRect(0, 0, W, H);
 
