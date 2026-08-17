@@ -4,6 +4,7 @@
 #include <web/WebServerManager.h>
 #include <network/DataOutput.h>
 #include <network/NtripPush.h>
+#include <network/Tailscale.h>
 
 // The soft-AP is the rover's data path and stays up in every state. Going
 // through a router instead costs a second wireless hop for every RTCM frame,
@@ -147,6 +148,7 @@ void networkTaskCode(void * parameter) {
 
     handleNetworkState(now);
     handleNtripPush();
+    handleTailscale();
     handleWebSocketQueue();
     handleTelemetry(now);
 

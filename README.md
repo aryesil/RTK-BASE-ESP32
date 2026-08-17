@@ -12,6 +12,7 @@ This project turns an ESP32 into a networked RTK base station. It receives RTCM3
 <h3>Validated RTCM3 forwarding</h3>  Frames are reassembled and CRC-24Q checked before they leave the device. NMEA is stripped out, so the radio link carries corrections only.
 <h3>NTRIP caster</h3>  NTRIP v1 (<code>ICY 200 OK</code>) and v2 on the same port as the raw stream, auto-detected per connection, with a source table and optional Basic authentication.
 <h3>UDP output</h3>  Fixed destination, subnet broadcast or client registration. One datagram per RTCM frame, so a lost packet costs one epoch instead of stalling the stream behind a TCP retransmit.
+<h3>Tailscale client</h3>  The device joins your tailnet directly, so the whole interface is reachable from any machine on the same account with nothing exposed to the internet. Enabling it trades some monitoring capacity for the memory it needs; with it off the base station is unchanged.
 <h3>Twelve hour history</h3>  Receiver health sampled every 30 s into a ring buffer and plotted on its own page: position drift, satellite count, mean C/N0, HDOP, correction output, and fix quality and interference as continuous colour strips.
 <h3>Rover visibility</h3>  NTRIP clients send a GGA back up the connection; it is parsed rather than discarded, so the consumer table shows each rover's fix quality, satellite count and baseline from the broadcast station position.
 <h3>Settings backup</h3>  The whole configuration, including the station coordinate held in the module, downloaded as one file and restorable from the Admin page.
@@ -337,6 +338,30 @@ Measured on an ESP32-WROOM-32D tracking 39 satellites: **2 % load on each core**
 └── docs/img/                   # Interface screenshots
 
 ````
+
+<h2>Tailscale</h2>
+
+Enter a reusable, ephemeral auth key on the Network page and the device appears on your tailnet as an ordinary node. The client registers a real lwIP interface carrying the 100.x address, so the web server already listening on every interface answers there too - nothing forwards or proxies. It needs the WiFi uplink; the access point has no route off the device, and the rover link and every RTCM output are unaffected either way.
+
+Tailscale has no username and password for a device. Enrolment uses an auth key from <i>Settings &rarr; Keys</i> in the admin console. The key is stored on the device and never sent back to the page.
+
+<h3>What it costs</h3>
+
+The client needs roughly 80 kB at runtime and this board has 320 kB with no PSRAM, so the tables are sized at boot from whether it is enabled:
+
+| | Client off | Client on |
+| --- | --- | --- |
+| History window | 12 hours | not collected |
+| Ionospheric monitor | on | off |
+| Simultaneous RTCM consumers | 6 TCP + 6 UDP | 4 + 4 |
+| Telemetry to a LAN browser | 1 Hz | 1 Hz |
+| Telemetry to a tailnet browser | — | every 5 s |
+
+Everything else is identical: all four RTCM transports, the NTRIP push, survey-in and fixed configuration, the sky plot and the carrier-to-noise charts, the rover back channel. Changing the setting requires a reboot, which is what makes one decision at startup enough.
+
+A browser reached through the tunnel gets a slower cadence deliberately. The tunnel has a smaller MTU and far more latency than the LAN, and a 3.3 kB frame every second does not drain before the next is due - the queue stays full and that client receives nothing at all.
+
+> The client is started once and never stopped. Its shutdown path blocks for three seconds and cannot reliably reclaim its task stacks, so restarting it in place would both stall the base station and leak about 29 kB each time.
 
 <h2>History</h2>
 

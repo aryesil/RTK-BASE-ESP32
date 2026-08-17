@@ -6,6 +6,7 @@
 #include <gnss/GNSS_Core.h>
 #include <gnss/BaseConfig.h>
 #include <math.h>
+#include <new>
 
 static WiFiServer* tcpServer = nullptr;
 static Preferences outPrefs;
@@ -41,7 +42,9 @@ struct TcpSlot {
   double     rLat, rLon, rAlt;
   uint32_t   ggaMs;
 };
-static TcpSlot slots[MAX_TCP_CLIENTS];
+/* Allocated at boot to rt.tcpClients, not a fixed array: the lean profile
+ * trades consumer slots for the Tailscale client's heap. */
+static TcpSlot *slots = nullptr;
 
 struct UdpSlot {
   IPAddress ip;
@@ -51,7 +54,7 @@ struct UdpSlot {
   uint32_t  sent;
   bool      used;
 };
-static UdpSlot udpSlots[MAX_UDP_CLIENTS];
+static UdpSlot *udpSlots = nullptr;
 
 // Pre-computed "Basic <base64(user:pass)>" for constant-work comparison.
 static char expectedAuth[80];
@@ -225,12 +228,12 @@ void saveOutputCfg() {
 // --------------------------------------------------------------------------
 static void closeAllClients() {
   if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
-    for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
+    for (int i = 0; i < rt.tcpClients; i++) {
       if (slots[i].mode != CM_EMPTY) slots[i].sock.stop();
       slots[i].mode = CM_EMPTY;
       slots[i].reqLen = 0;
     }
-    for (int i = 0; i < MAX_UDP_CLIENTS; i++) udpSlots[i].used = false;
+    for (int i = 0; i < rt.udpClients; i++) udpSlots[i].used = false;
     xSemaphoreGive(tcpMutex);
   }
 }
@@ -281,6 +284,19 @@ static void applyRestart() {
 }
 
 void initDataOutput() {
+  // new[], not calloc: TcpSlot holds a WiFiClient and UdpSlot an IPAddress, and
+  // both need their constructors run.
+  slots    = new (std::nothrow) TcpSlot[rt.tcpClients];
+  udpSlots = new (std::nothrow) UdpSlot[rt.udpClients];
+  if (!slots || !udpSlots) {
+    Log.println("[OUT] Consumer tables could not be allocated.");
+    return;
+  }
+  for (int i = 0; i < rt.tcpClients; i++) {
+    slots[i].mode = CM_EMPTY; slots[i].reqLen = 0; slots[i].ggaLen = 0;
+    slots[i].ggaMs = 0; slots[i].hasFix = false; slots[i].sent = 0;
+  }
+  for (int i = 0; i < rt.udpClients; i++) udpSlots[i].used = false;
   loadOutputCfg();
   applyRestart();   // setup() runs before the polling task exists
 }
@@ -391,7 +407,7 @@ static void acceptNewClients() {
 
   bool placed = false;
   if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
-    for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
+    for (int i = 0; i < rt.tcpClients; i++) {
       if (slots[i].mode != CM_EMPTY && slots[i].sock.connected()) continue;
       if (slots[i].mode != CM_EMPTY) slots[i].sock.stop();
 
@@ -494,7 +510,7 @@ static void readRoverReports(TcpSlot &s) {
 
 static void serviceHandshakes() {
   if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
-    for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
+    for (int i = 0; i < rt.tcpClients; i++) {
       TcpSlot &s = slots[i];
       if (s.mode == CM_EMPTY) continue;
 
@@ -566,7 +582,7 @@ static void serviceUdpRegistrations() {
     if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
       int free = -1;
       bool known = false;
-      for (int i = 0; i < MAX_UDP_CLIENTS; i++) {
+      for (int i = 0; i < rt.udpClients; i++) {
         if (udpSlots[i].used && udpSlots[i].ip == ip && udpSlots[i].port == port) {
           udpSlots[i].lastSeen = now;
           known = true;
@@ -595,7 +611,7 @@ static void serviceUdpRegistrations() {
 
   uint32_t now = millis();
   if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
-    for (int i = 0; i < MAX_UDP_CLIENTS; i++) {
+    for (int i = 0; i < rt.udpClients; i++) {
       if (udpSlots[i].used && now - udpSlots[i].lastSeen > UDP_CLIENT_TIMEOUT_MS) {
         udpSlots[i].used = false;
       }
@@ -696,7 +712,7 @@ void sendRtcmFrame(const uint8_t* frame, size_t len, uint16_t msgType) {
   usbStreamWrite(frame, len);
 
   if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
-    for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
+    for (int i = 0; i < rt.tcpClients; i++) {
       TcpSlot &s = slots[i];
       if (s.mode != CM_RAW && s.mode != CM_NTRIP) continue;
       if (!s.sock.connected()) { s.sock.stop(); s.mode = CM_EMPTY; continue; }
@@ -724,7 +740,7 @@ void sendRtcmFrame(const uint8_t* frame, size_t len, uint16_t msgType) {
         if (ap) udpSendTo(IPAddress(ap | 0xFF000000), outCfg.udpPort, frame, len);
       }
 
-      for (int i = 0; i < MAX_UDP_CLIENTS; i++) {
+      for (int i = 0; i < rt.udpClients; i++) {
         if (!udpSlots[i].used) continue;
         // One datagram per RTCM frame: the receiver never has to re-frame, and
         // a lost packet costs one epoch instead of stalling the stream.
@@ -741,7 +757,7 @@ void sendRtcmFrame(const uint8_t* frame, size_t len, uint16_t msgType) {
 int tcpClientCount() {
   int n = 0;
   if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
-    for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
+    for (int i = 0; i < rt.tcpClients; i++) {
       if (slots[i].mode == CM_RAW || slots[i].mode == CM_NTRIP) n++;
     }
     xSemaphoreGive(tcpMutex);
@@ -752,7 +768,7 @@ int tcpClientCount() {
 int udpClientCount() {
   int n = 0;
   if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
-    for (int i = 0; i < MAX_UDP_CLIENTS; i++) if (udpSlots[i].used) n++;
+    for (int i = 0; i < rt.udpClients; i++) if (udpSlots[i].used) n++;
     xSemaphoreGive(tcpMutex);
   }
   return n;
@@ -761,7 +777,7 @@ int udpClientCount() {
 int snapshotTcpClients(RtcmClientInfo* out, int max) {
   int n = 0;
   if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
-    for (int i = 0; i < MAX_TCP_CLIENTS && n < max; i++) {
+    for (int i = 0; i < rt.tcpClients && n < max; i++) {
       if (slots[i].mode != CM_RAW && slots[i].mode != CM_NTRIP) continue;
       out[n].mode = slots[i].mode;
       strlcpy(out[n].ip, slots[i].sock.remoteIP().toString().c_str(), sizeof(out[n].ip));
@@ -799,7 +815,7 @@ int snapshotTcpClients(RtcmClientInfo* out, int max) {
 int snapshotUdpClients(UdpClientInfo* out, int max) {
   int n = 0;
   if (xSemaphoreTake(tcpMutex, portMAX_DELAY)) {
-    for (int i = 0; i < MAX_UDP_CLIENTS && n < max; i++) {
+    for (int i = 0; i < rt.udpClients && n < max; i++) {
       if (!udpSlots[i].used) continue;
       strlcpy(out[n].ip, udpSlots[i].ip.toString().c_str(), sizeof(out[n].ip));
       out[n].port = udpSlots[i].port;

@@ -50,6 +50,7 @@ static IonoSat* slotFor(uint8_t sys, int prn) {
 }
 
 void ionoFeedMsm7(const uint8_t* p, uint16_t payloadLen, uint16_t msgType) {
+  if (!rt.iono) return;
   uint8_t sys;
   switch (msgType) {
     case 1077: sys = SYS_GPS; break;

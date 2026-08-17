@@ -1,0 +1,76 @@
+# --- Arduino core requirements --------------------------------------------
+# esp32-arduino refuses to build at any other tick rate, and setup()/loop()
+# only exist with the autostart shim.
+CONFIG_FREERTOS_HZ=1000
+CONFIG_AUTOSTART_ARDUINO=y
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# --- Arduino library selection --------------------------------------------
+# Built as an ESP-IDF component, Arduino compiles every bundled library by
+# default - including RainMaker and Insights, whose ESP-IDF components are
+# stubbed out here because their published packages do not build. Selecting
+# only what this firmware actually links also keeps a lot of flash free for
+# the Tailscale client.
+CONFIG_ARDUINO_SELECTIVE_COMPILATION=y
+CONFIG_ARDUINO_SELECTIVE_WiFi=y
+CONFIG_ARDUINO_SELECTIVE_Network=y
+CONFIG_ARDUINO_SELECTIVE_Preferences=y
+CONFIG_ARDUINO_SELECTIVE_ArduinoOTA=y
+CONFIG_ARDUINO_SELECTIVE_ESPmDNS=y
+CONFIG_ARDUINO_SELECTIVE_Update=y
+CONFIG_ARDUINO_SELECTIVE_AsyncUDP=y
+CONFIG_ARDUINO_SELECTIVE_FS=y
+CONFIG_ARDUINO_SELECTIVE_NetworkClientSecure=y
+# Everything below is defaulted on by the Kconfig and has to be turned off
+# explicitly. RainMaker and Insights additionally fail to build at all.
+CONFIG_ARDUINO_SELECTIVE_SPI=n
+CONFIG_ARDUINO_SELECTIVE_Wire=n
+CONFIG_ARDUINO_SELECTIVE_ESP_SR=n
+CONFIG_ARDUINO_SELECTIVE_EEPROM=n
+CONFIG_ARDUINO_SELECTIVE_Ticker=n
+CONFIG_ARDUINO_SELECTIVE_Zigbee=n
+CONFIG_ARDUINO_SELECTIVE_SD=n
+CONFIG_ARDUINO_SELECTIVE_SD_MMC=n
+CONFIG_ARDUINO_SELECTIVE_SPIFFS=n
+CONFIG_ARDUINO_SELECTIVE_FFat=n
+CONFIG_ARDUINO_SELECTIVE_LittleFS=n
+CONFIG_ARDUINO_SELECTIVE_Ethernet=n
+CONFIG_ARDUINO_SELECTIVE_PPP=n
+CONFIG_ARDUINO_SELECTIVE_DNSServer=n
+CONFIG_ARDUINO_SELECTIVE_HTTPClient=n
+CONFIG_ARDUINO_SELECTIVE_Matter=n
+CONFIG_ARDUINO_SELECTIVE_NetBIOS=n
+CONFIG_ARDUINO_SELECTIVE_WebServer=n
+CONFIG_ARDUINO_SELECTIVE_WiFiProv=n
+CONFIG_ARDUINO_SELECTIVE_BLE=n
+CONFIG_ARDUINO_SELECTIVE_BluetoothSerial=n
+CONFIG_ARDUINO_SELECTIVE_SimpleBLE=n
+CONFIG_ARDUINO_SELECTIVE_RainMaker=n
+CONFIG_ARDUINO_SELECTIVE_OpenThread=n
+CONFIG_ARDUINO_SELECTIVE_Insights=n
+
+# --- microlink (Tailscale client) -----------------------------------------
+CONFIG_ML_MAX_PEERS=5
+# 24KB. Held for the life of the program, so it competes directly with the
+# client's own task stacks: at 48KB the coordination task could not be created
+# at all. The measured MapResponse on this tailnet is 19381 bytes, so this
+# leaves about 20% headroom - watch for "H2 buffer full, truncating".
+CONFIG_ML_H2_BUFFER_SIZE_KB=24
+CONFIG_ML_JSON_BUFFER_SIZE_KB=24
+CONFIG_ML_NVS_MAX_PEERS=16
+CONFIG_ML_ENABLE_CELLULAR=n
+CONFIG_ML_ENABLE_CONFIG_HTTPD=n
+CONFIG_ML_ENABLE_NET_SWITCH=n
+CONFIG_ML_ZERO_COPY_WG=n
+
+# Noise (ts2021) needs ChaCha20-Poly1305; ESP-IDF leaves it off by default.
+CONFIG_MBEDTLS_CHACHA20_C=y
+CONFIG_MBEDTLS_POLY1305_C=y
+CONFIG_MBEDTLS_CHACHAPOLY_C=y
+
+# DERP frames are small. The IDF default of 16KB in + 16KB out per TLS session
+# is 26KB of heap this board cannot spare.
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=2048
+
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y

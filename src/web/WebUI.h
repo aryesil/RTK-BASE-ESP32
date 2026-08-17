@@ -822,17 +822,67 @@ code{background:#f2f5f8;padding:1px 5px;border-radius:3px;font-size:12px}
       </div>
     </div>
   </div>
+
+  <div class="box">
+    <h3>Tailscale</h3>
+    <div class="cols">
+      <div>
+        <div class="kv">
+          <b>State</b><span id="tsState">--</span>
+          <b>Tailnet address</b><span id="tsIp">--</span>
+          <b>Peers</b><span id="tsPeers">--</span>
+        </div>
+        <label class="f">Enabled</label>
+        <select id="tsEn"><option value="0">No</option><option value="1">Yes</option></select>
+        <label class="f">Device name on the tailnet</label>
+        <input type="text" id="tsName" maxlength="31" placeholder="rtk-base">
+        <label class="f">Auth key (leave blank to keep the stored one)</label>
+        <input type="text" id="tsKey" maxlength="95" placeholder="tskey-auth-...">
+        <button class="btn" onclick="saveTailscale()">Apply Tailscale settings</button>
+        <div class="msg" id="tsMsg"></div>
+      </div>
+      <div class="note">
+        Puts this device on your tailnet, so the whole interface is reachable
+        from any other machine signed into the same Tailscale account &mdash; no
+        port forwarding, nothing exposed to the internet. The address shown
+        above is what you open in a browser.<br><br>
+        <b>Tailscale has no username and password for a device.</b> Enrolment
+        uses an auth key: in the admin console open
+        <i>Settings &rarr; Keys &rarr; Generate auth key</i>, tick
+        <i>Reusable</i> and <i>Ephemeral</i>, and paste the
+        <code>tskey-auth-&hellip;</code> string here. The key is stored on the
+        device and is never sent back to this page.<br><br>
+        <b>Needs the WiFi uplink.</b> The coordination server is on the
+        internet, so the station interface has to be joined; the access point
+        alone has no route off the device. The rover link and every RTCM output
+        are unaffected either way.<br><br>
+        <b>Changes take effect after a reboot.</b> The client reads its
+        settings once when it starts, and stopping it in place is not safe
+        here: the shutdown path blocks for three seconds and cannot reliably
+        reclaim its 42 kB of task stacks, so restarting in place would both
+        stall the base station and leak memory each time.<br><br>
+        <b>This costs base station capacity.</b> The client holds a 32 kB map
+        buffer and four task stacks for as long as it runs, on a board with
+        320 kB of RAM and no PSRAM. To make room, simultaneous RTCM consumers
+        are capped at two TCP/NTRIP and two UDP, the history window is six hours
+        rather than twelve, and peer capacity is five tunnels. Everything else
+        &mdash; every RTCM output, the NTRIP push, the rover link &mdash; runs
+        exactly as it does with this off.
+      </div>
+    </div>
+  </div>
 </section>
 
 <!-- ================= TERMINAL ================= -->
 <!-- ================= HISTORY ================= -->
 <section class="page" id="p-history">
   <div class="box">
-    <h3>Last 12 Hours</h3>
+    <h3>Recent History</h3>
     <div class="hsum" id="hsSummary"></div>
     <div class="note">
       Sampled every 30 seconds since the device booted, held in memory only:
-      a reboot starts the window again. Move the pointer across any chart to
+      a reboot starts the window again. The window is six hours; it was twelve
+      before the Tailscale client needed the memory. Move the pointer across any chart to
       read every value at that moment.
     </div>
   </div>
@@ -1039,7 +1089,8 @@ let D = null, page = 'overview';
 // The device sends the satellite and ionosphere arrays every other tick to keep
 // frames small; carry the last ones forward on the ticks that omit them.
 let lastSig = [], lastIo = [], lastRx = 0, staleTimer = null;
-let baseFormLoaded = false, outFormLoaded = false, netFormLoaded = false, termLines = [];
+let baseFormLoaded = false, outFormLoaded = false, netFormLoaded = false;
+let tsFormLoaded = false, termLines = [];
 let scatter = [];   // {e, n, h} in metres relative to the running mean
 
 /* ---------------- routing ---------------- */
@@ -1052,7 +1103,7 @@ function route(){
   document.getElementById('crumb').textContent =
     ({overview:'Overview', gnss:'GNSS > Satellites and Signals', base:'Base Mode > Position Mode',
       output:'Data Output > RTCM Distribution', network:'Network > Interfaces',
-      history:'History > Last 12 Hours',
+      history:'History > Recent',
       terminal:'Terminal', admin:'Admin'})[p];
   if(p === 'history') loadHistory(true);
   if(D) render();
@@ -1221,7 +1272,7 @@ function render(){
   else if(page === 'gnss') renderGnss();
   else if(page === 'base') renderBase();
   else if(page === 'output') renderOutput();
-  else if(page === 'network') renderNetwork();
+  else if(page === 'network'){ renderNetwork(); renderTailscale(); }
   else if(page === 'admin') renderAdmin();
   // Fetched rather than pushed: the ring buffer only advances every 30 s, so
   // there is nothing to gain from putting it on the 1 Hz telemetry message.
@@ -1885,7 +1936,7 @@ const JAMTXT  = {0:'unknown', 1:'clean', 2:'warning', 3:'critical'};
 function parseHistory(buf){
   const d = new DataView(buf);
   if(d.getUint32(0, true) !== 0x484B5452) return null;
-  const count = d.getUint16(4, true), iv = d.getUint16(6, true);
+  const count = d.getUint16(4, true), iv = d.getUint16(6, true);   // cap = ring size
   const head = d.getUint16(8, true), filled = d.getUint16(10, true);
   const up = d.getUint32(12, true);
   const ref = {lat: d.getFloat64(24, true), lon: d.getFloat64(32, true),
@@ -1912,7 +1963,7 @@ function parseHistory(buf){
   }
   // Age in seconds of each sample, counting back from the newest.
   rows.forEach((r, i) => r.age = (rows.length - 1 - i) * iv);
-  return {iv, up, ref, rows};
+  return {iv, up, ref, rows, cap: count};
 }
 
 function loadHistory(force){
@@ -2034,7 +2085,7 @@ function drawHistory(){
   }
   $('hsSummary').innerHTML = [
     ['Window covered', cover < 1 ? Math.round(span / 60) + ' min' : cover.toFixed(1) + ' h'],
-    ['Samples', rows.length + ' of 1440'],
+    ['Samples', rows.length + ' of ' + hist.cap],
     ['Horizontal spread', pos.length ? spread.toFixed(0) + ' cm' : '&ndash;'],
     ['Mean C/N0 now', last.cn0 ? last.cn0 + ' dB-Hz' : '&ndash;'],
     ['Lowest C/N0 seen', cn0s.length ? Math.min.apply(null, cn0s) + ' dB-Hz' : '&ndash;'],
@@ -2602,6 +2653,39 @@ function scanNets(attempt){
     }
     setNetOptions(d, d.length ? 'Select a network...' : 'No networks found');
   }).catch(() => setNetOptions([], 'Scan failed'));
+}
+
+const TS_STATE = ['Idle','Waiting for WiFi','Connecting','Registering',
+                  'Connected','Reconnecting','Error'];
+
+function renderTailscale(){
+  const t = D.ts; if(!t) return;
+  txt('tsState', !t.buf ? 'unavailable (no memory)'
+                : t.fail ? t.msg
+                : t.rb ? 'settings saved - reboot to apply'
+                : !t.en ? 'disabled'
+                : (TS_STATE[t.st] || '?') + (t.msg && t.msg !== TS_STATE[t.st] ? ' - ' + t.msg : ''));
+  txt('tsIp', t.ip || '--');
+  txt('tsPeers', t.en ? t.peers : '--');
+  if(!tsFormLoaded){
+    tsFormLoaded = true;
+    $('tsEn').value = t.en ? '1' : '0';
+    $('tsName').value = t.name || '';
+    // Never echoed back by the device; the field only says whether one is held.
+    $('tsKey').placeholder = t.haveKey ? '(key stored - leave blank to keep it)'
+                                       : 'tskey-auth-...';
+  }
+}
+
+function saveTailscale(){
+  const q = new URLSearchParams({action:'save', en:$('tsEn').value,
+                                 name:$('tsName').value, key:$('tsKey').value});
+  fetch('/api/tailscale?' + q).then(r => r.json()).then(j => {
+    showMsg('tsMsg', j.ok ? 'Saved. The client restarts with the new settings.'
+                          : (j.msg || 'Rejected.'), !!j.ok);
+    $('tsKey').value = '';
+    tsFormLoaded = false;
+  }).catch(() => showMsg('tsMsg', 'Device unreachable.', false));
 }
 
 function saveAp(){

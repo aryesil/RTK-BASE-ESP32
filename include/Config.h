@@ -18,7 +18,9 @@
 
 #define UDP_PORT  2102
 
-// Max simultaneous RTCM stream consumers
+// Max simultaneous RTCM stream consumers. The tables are sized at boot from
+// the Tailscale setting - see LEAN_* below - so the ceiling here is what the
+// device offers when the client is off.
 #define MAX_TCP_CLIENTS 6
 #define MAX_UDP_CLIENTS 6
 
@@ -79,6 +81,39 @@
 #define HISTORY_SAMPLES     1440
 #define HISTORY_INTERVAL_MS 30000
 
+// ---------------------------------------------------------------------------
+// Lean profile
+//
+// The Tailscale client needs roughly 80 kB at runtime and this board has no
+// PSRAM, so the tables below are allocated at boot and sized from whether the
+// client is enabled - full size when it is off, lean when it is on. Changing
+// the setting already requires a reboot, so one decision at startup covers it
+// and nothing has to be resized while running.
+// ---------------------------------------------------------------------------
+// What gets dropped, in the order it was judged least missed. The base
+// station's job is to broadcast corrections; everything here is monitoring.
+//   history       the largest single allocation, 11-23 kB, a view not a function
+//   iono monitor  its own table plus a fifth of every telemetry frame, and the
+//                 MSM7 decode that feeds it
+// The per-satellite signal rows stay. They are about a third of the frame but
+// that is a transient buffer, not held memory - 1.2 kB against the 11.5 kB the
+// history ring costs permanently - and they are what the sky plot and the C/N0
+// charts are drawn from.
+// Kept at full size: every RTCM path, the base configuration, the network
+// settings, the rover back channel, the sky plot and the headline status.
+#define LEAN_HISTORY_SAMPLES 0      // history off entirely
+#define LEAN_TCP_CLIENTS     4
+#define LEAN_UDP_CLIENTS     4
+#define LEAN_TELEMETRY_BUF   5120   // lean frame measures about 3.2 kB
+#define FULL_TELEMETRY_BUF   10240
+
+// Telemetry cadence for a browser reached over the tailnet. The tunnel has a
+// smaller MTU and far more latency than the LAN, and a 3.3 kB frame every
+// second does not drain before the next one is due - the queue stays full and
+// the client receives nothing at all. Five seconds is plenty for a management
+// view; the LAN keeps its 1 Hz.
+#define TELEMETRY_TAILNET_MS 5000
+
 #define AP_SSID   "ESP32_RTK_BASE"
 #define RX_MODEL  "LC29H (BS)"
-#define FW_VERSION "1.2.0"
+#define FW_VERSION "1.3.0"

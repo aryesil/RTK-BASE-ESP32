@@ -4,3 +4,8 @@
 .vscode/launch.json
 .vscode/ipch
 .DS_Store
+
+# ESP-IDF build artefacts from the dual arduino+espidf framework
+managed_components/
+dependencies.lock
+sdkconfig.esp32-dev

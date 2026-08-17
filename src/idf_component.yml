@@ -1,0 +1,10 @@
+dependencies:
+  # Replaced with local stubs: the published packages embed certificate files
+  # they do not ship, which fails the build. Neither is used by this firmware.
+  # The directory names must match the component names the build expects.
+  espressif/esp_insights:
+    version: "*"
+    override_path: "../components/espressif__esp_insights"
+  espressif/esp_rainmaker:
+    version: "*"
+    override_path: "../components/espressif__esp_rainmaker"

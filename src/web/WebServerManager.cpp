@@ -6,6 +6,8 @@
 #include <network/DataOutput.h>
 #include <network/NetworkManager.h>
 #include <network/NtripPush.h>
+#include <network/Tailscale.h>
+#include <microlink.h>
 #include <stdarg.h>
 #include <gnss/Iono.h>
 #include <system/History.h>
@@ -599,6 +601,10 @@ void setupWebServer() {
   server.on("/api/history", HTTP_GET, [](AsyncWebServerRequest *request){
     size_t len = 0;
     const uint8_t *b = historySnapshot(len);
+    if (!b || !len) {   // lean profile: history is not collected
+      request->send(204);
+      return;
+    }
     // Sent straight from the static buffer. A sample may be rewritten while
     // the response streams; one record briefly mixing an old and a new field
     // is invisible on a twelve hour chart, and copying 23 kB to avoid it would
@@ -631,6 +637,32 @@ void setupWebServer() {
   server.on("/api/base", HTTP_GET, handleBaseApi);
   server.on("/api/output", HTTP_GET, handleOutputApi);
   server.on("/api/net", HTTP_GET, handleNetApi);
+  server.on("/api/tailscale", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!request->hasParam("action") ||
+        request->getParam("action")->value() != "save") {
+      request->send(400, "application/json", "{\"ok\":false,\"msg\":\"Unknown action\"}");
+      return;
+    }
+    {
+      BaseLockWeb lock;
+      if (request->hasParam("en"))
+        tsCfg.enabled = request->getParam("en")->value().toInt() != 0;
+      if (request->hasParam("key")) {
+        String k = request->getParam("key")->value();
+        k.trim();
+        // Blank means "leave it alone", so the stored key is never wiped by a
+        // save that only meant to toggle the client on or off.
+        if (k.length()) strlcpy(tsCfg.authKey, k.c_str(), sizeof(tsCfg.authKey));
+      }
+      if (request->hasParam("name")) {
+        String n = request->getParam("name")->value();
+        n.trim();
+        if (n.length()) strlcpy(tsCfg.devName, n.c_str(), sizeof(tsCfg.devName));
+      }
+      saveTailscaleCfg();
+    }
+    request->send(200, "application/json", "{\"ok\":true}");
+  });
   server.on("/api/push", HTTP_GET, handlePushApi);
 
   // Asynchronous: a blocking scan here would stall the AsyncTCP task (and every
@@ -714,7 +746,13 @@ void handleTelemetry(uint32_t now) {
   static uint32_t lastCpuCheckTime = millis();
   static SatSignal localSigs[MAX_SIGNALS];
   static bool localUsed[MAX_SIGNALS];
-  static char jsonBuffer[10240];
+  // Sized at boot from the lean profile rather than fixed: the full document
+  // needs the larger buffer, and the lean one produces a smaller document.
+  static char *jsonBuffer = nullptr;
+  if (!jsonBuffer) {
+    jsonBuffer = (char *)malloc(rt.telemetryBuf);
+    if (!jsonBuffer) return;
+  }
 
   uint32_t timeDiffMillis = now - lastCpuCheckTime;
   if (timeDiffMillis < 1000) return;
@@ -758,14 +796,18 @@ void handleTelemetry(uint32_t now) {
   lastCpuCheckTime = now;
   if (ws.count() == 0) return;
 
-  // AsyncWebSocket discards a message outright when a client's queue is full,
-  // which the page sees as a freeze with no explanation. Check first, skip
-  // deliberately and count it, so a backed-up link is visible instead of
-  // silently eating updates. Building the document is the expensive part, so
-  // this also saves the work.
+  // Built once if at least one client can take it. Deliberately not
+  // availableForWriteAll(), which is true only when every client is ready: a
+  // browser reaching the device over the tailnet is relayed and slow, its queue
+  // backs up, and the all-clients test then withheld the frame from the healthy
+  // client on the LAN as well. Opening the second connection killed both.
   static uint32_t telemSeq = 0, telemSkipped = 0;
   telemSeq++;
-  if (!ws.availableForWriteAll()) {
+  bool anyReady = false;
+  for (auto &c : ws.getClients()) {
+    if (c.status() == WS_CONNECTED && !c.queueIsFull()) { anyReady = true; break; }
+  }
+  if (!anyReady) {
     telemSkipped++;
     return;
   }
@@ -839,7 +881,7 @@ void handleTelemetry(uint32_t now) {
   static IonoSat ionoLocal[MAX_IONO_SATS];
   int ionoN = 0, ionoUsable = 0;
   float dSum = 0;
-  if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+  if (rt.iono && xSemaphoreTake(dataMutex, portMAX_DELAY)) {
     ionoN = ionoSatCount;
     memcpy(ionoLocal, ionoSats, ionoN * sizeof(IonoSat));
     xSemaphoreGive(dataMutex);
@@ -873,9 +915,9 @@ void handleTelemetry(uint32_t now) {
               ionoUsable ? dSum / ionoUsable : -1.0f);
 
   RtcmClientInfo tinfo[MAX_TCP_CLIENTS];
-  int tn = snapshotTcpClients(tinfo, MAX_TCP_CLIENTS);
+  int tn = snapshotTcpClients(tinfo, rt.tcpClients);
   UdpClientInfo uinfo[MAX_UDP_CLIENTS];
-  int un = snapshotUdpClients(uinfo, MAX_UDP_CLIENTS);
+  int un = snapshotUdpClients(uinfo, rt.udpClients);
 
   uint32_t nowMs = millis();
   char timeStr[12] = "--:--:--";
@@ -886,7 +928,7 @@ void handleTelemetry(uint32_t now) {
   String apIp  = WiFi.softAPIP().toString();
   String ssid  = WiFi.SSID();
 
-  JBuf j(jsonBuffer, sizeof(jsonBuffer));
+  JBuf j(jsonBuffer, rt.telemetryBuf);
   j.put('{'); j.first = true;
 
   j.kv("seq",  (unsigned long)telemSeq);
@@ -951,6 +993,30 @@ void handleTelemetry(uint32_t now) {
     j.kv("usbTx",   (unsigned long)usbStats.bytes);
     j.kv("usbFr",   (unsigned long)usbStats.frames);
     j.kv("usbDrop", (unsigned long)usbStats.dropped);
+  j.end('}');
+
+  j.obj("ts");
+    j.kv("en",    tsCfg.enabled);
+    j.kv("st",    (int)tsStatus.state);
+    j.kv("msg",   tsStatus.msg);
+    j.kv("peers", (int)tsStatus.peers);
+    j.kv("buf",   tsStatus.bufReady);
+    j.kv("fail",  tsStatus.failed);
+    j.kv("rb",    tsStatus.needReboot);
+    j.kv("lean",  rt.lean);
+    j.kv("sig",   rt.signalDetail);
+    j.kv("iono",  rt.iono);
+    j.kv("hist",  (int)rt.historySamples);
+    j.kv("cons",  (int)rt.tcpClients);
+    j.kv("name",  tsCfg.devName);
+    // The key itself never leaves the device; the page only needs to know
+    // whether one is stored.
+    j.kv("haveKey", (bool)(tsCfg.authKey[0] != '\0'));
+    {
+      char ip[16] = "";
+      if (tsStatus.vpnIp) microlink_ip_to_str(tsStatus.vpnIp, ip);
+      j.kv("ip", ip);
+    }
   j.end('}');
 
   // [sysIdx, prn, elev, azim, rawSlant*100, deltaVert*100, arcSeconds, ippLat, ippLon]
@@ -1123,9 +1189,26 @@ void handleTelemetry(uint32_t now) {
   j.put('}');
   size_t jsonLen = j.n;
 
-  AsyncWebSocketMessageBuffer * wsBuf = ws.makeBuffer(jsonLen);
-  if (wsBuf) {
-      memcpy(wsBuf->get(), jsonBuffer, jsonLen);
-      ws.textAll(wsBuf);
+  // Per client, so one backed-up link cannot stall the others, and slower for
+  // anything arriving through the tunnel.
+  static uint32_t lastTailnetMs = 0;
+  bool tailnetDue = (nowMs - lastTailnetMs) >= TELEMETRY_TAILNET_MS;
+  bool sentTailnet = false;
+
+  for (auto &c : ws.getClients()) {
+    if (c.status() != WS_CONNECTED) continue;
+
+    // 100.64.0.0/10 is the CGNAT range Tailscale assigns.
+    IPAddress rip = c.remoteIP();
+    bool viaTailnet = (rip[0] == 100 && rip[1] >= 64 && rip[1] <= 127);
+    if (viaTailnet && !tailnetDue) continue;
+
+    if (c.queueIsFull()) { telemSkipped++; continue; }
+    AsyncWebSocketMessageBuffer *wsBuf = ws.makeBuffer(jsonLen);
+    if (!wsBuf) { telemSkipped++; break; }   // out of heap: stop, do not retry
+    memcpy(wsBuf->get(), jsonBuffer, jsonLen);
+    c.text(wsBuf);
+    if (viaTailnet) sentTailnet = true;
   }
+  if (sentTailnet) lastTailnetMs = nowMs;
 }

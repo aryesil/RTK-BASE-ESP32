@@ -70,6 +70,7 @@ static void dropAndBackoff(const char* why) {
 void handleNtripPush() {
   uint32_t now = millis();
 
+
   if (!pushCfg.enabled || pushCfg.host[0] == '\0' || pushCfg.mount[0] == '\0') {
     if (pushState.state != PUSH_OFF) {
       pending.stop();

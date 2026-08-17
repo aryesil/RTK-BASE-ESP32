@@ -21,6 +21,11 @@ OutputCfg outCfg = { true, RTCM_PORT, 0, true, UDP_PORT, "", 0, 0, false, "RTK",
                      false, USB_BAUD_DEFAULT };
 RtcmStats rtcmStats = {};
 
+TsCfg    tsCfg = { false, "", "" };
+RuntimeLimits rt = { HISTORY_SAMPLES, MAX_TCP_CLIENTS, MAX_UDP_CLIENTS,
+                     FULL_TELEMETRY_BUF, true, true, false };
+TsStatus tsStatus = { 0, 0, 0, false, false, false, false, "Disabled" };
+
 volatile bool logMuted = false;
 MutedLog Log;
 UsbStats usbStats = {};

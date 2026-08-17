@@ -226,6 +226,43 @@ struct UsbStats {
 };
 extern UsbStats usbStats;
 
+// Tailscale client settings and status. The auth key is what Tailscale
+// actually uses to enrol a device - there is no username/password login for a
+// node - so this is a single reusable, ephemeral tskey-auth-... from the admin
+// console.
+struct TsCfg {
+  bool enabled;
+  char authKey[96];
+  char devName[32];
+};
+extern TsCfg tsCfg;
+
+// Chosen once at boot from tsCfg.enabled and never changed afterwards. Code
+// that walks the client or history tables must use these, not the compile-time
+// ceilings, or it will run off the end of a lean allocation.
+struct RuntimeLimits {
+  uint16_t historySamples;
+  uint8_t  tcpClients;
+  uint8_t  udpClients;
+  uint16_t telemetryBuf;
+  bool     signalDetail;   // per-satellite rows in telemetry (sky plot, C/N0)
+  bool     iono;           // ionospheric monitor
+  bool     lean;
+};
+extern RuntimeLimits rt;
+
+struct TsStatus {
+  uint8_t  state;      // mirrors microlink_state_t
+  uint32_t vpnIp;      // host byte order, 0 = not assigned yet
+  uint8_t  peers;
+  bool     bufReady;   // the map buffer was claimed at boot
+  bool     running;
+  bool     failed;      // start refused; not retried
+  bool     needReboot;  // settings changed since the client came up
+  char     msg[56];
+};
+extern TsStatus tsStatus;
+
 struct RtcmStats {
   uint32_t frames;        // valid frames forwarded since boot
   uint32_t crcErrors;

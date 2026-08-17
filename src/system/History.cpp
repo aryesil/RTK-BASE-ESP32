@@ -31,12 +31,12 @@ struct HistSample {
   uint8_t  tracked;   // 15  satellites being tracked (from GSV)
 };                    // 16
 
-struct HistBlob {
-  HistHeader hdr;
-  HistSample s[HISTORY_SAMPLES];
-};
-
-static HistBlob blob;
+/* Header and ring in one allocation so the whole thing can be served as a
+ * single response, sized at boot from rt.historySamples. */
+static uint8_t   *blobMem = nullptr;
+static HistHeader *hdr    = nullptr;
+static HistSample *ring   = nullptr;
+static size_t     blobLen = 0;
 static uint32_t lastSampleMs = 0;
 static bool     haveRef = false;
 
@@ -44,10 +44,19 @@ static_assert(sizeof(HistHeader) == 48, "header layout changed");
 static_assert(sizeof(HistSample) == 16, "sample layout changed");
 
 void historyInit() {
-  memset(&blob, 0, sizeof(blob));
-  blob.hdr.magic       = 0x484B5452;   // 'RTKH' little-endian
-  blob.hdr.count       = HISTORY_SAMPLES;
-  blob.hdr.intervalSec = HISTORY_INTERVAL_MS / 1000;
+  uint16_t n = rt.historySamples;
+  if (n == 0) return;              // lean profile: no history at all
+  blobLen = sizeof(HistHeader) + (size_t)n * sizeof(HistSample);
+  blobMem = (uint8_t *)calloc(1, blobLen);
+  if (!blobMem) {                       // no history rather than no boot
+    blobLen = 0;
+    return;
+  }
+  hdr  = (HistHeader *)blobMem;
+  ring = (HistSample *)(blobMem + sizeof(HistHeader));
+  hdr->magic       = 0x484B5452;   // 'RTKH' little-endian
+  hdr->count       = n;
+  hdr->intervalSec = HISTORY_INTERVAL_MS / 1000;
   lastSampleMs = 0;
   haveRef = false;
 }
@@ -66,6 +75,7 @@ void historyFeed(uint32_t nowMs, uint8_t satsUsed, uint8_t satsTracked,
                  uint8_t fixQual, uint8_t jamL1, uint8_t jamL5,
                  bool haveFix, double lat, double lon, double alt,
                  uint32_t bytesSec, float ionoMeanM) {
+  if (!blobMem) return;
   if (lastSampleMs && (nowMs - lastSampleMs) < HISTORY_INTERVAL_MS) return;
   lastSampleMs = nowMs;
 
@@ -73,13 +83,13 @@ void historyFeed(uint32_t nowMs, uint8_t satsUsed, uint8_t satsTracked,
   // that tracked the current position would centre itself and hide the very
   // drift this chart exists to show.
   if (haveFix && !haveRef) {
-    blob.hdr.refLat = lat;
-    blob.hdr.refLon = lon;
-    blob.hdr.refAlt = alt;
+    hdr->refLat = lat;
+    hdr->refLon = lon;
+    hdr->refAlt = alt;
     haveRef = true;
   }
 
-  HistSample &e = blob.s[blob.hdr.head];
+  HistSample &e = ring[hdr->head];
   e.sats    = satsUsed;
   e.tracked = satsTracked;
   e.cn0   = meanCn0;
@@ -90,10 +100,10 @@ void historyFeed(uint32_t nowMs, uint8_t satsUsed, uint8_t satsTracked,
   e.bps   = bytesSec > 65535 ? 65535 : (uint16_t)bytesSec;
 
   if (haveFix && haveRef) {
-    double mPerDegLon = 111320.0 * cos(blob.hdr.refLat * M_PI / 180.0);
-    e.dN = toCm((lat - blob.hdr.refLat) * 111320.0);
-    e.dE = toCm((lon - blob.hdr.refLon) * mPerDegLon);
-    e.dU = toCm(alt - blob.hdr.refAlt);
+    double mPerDegLon = 111320.0 * cos(hdr->refLat * M_PI / 180.0);
+    e.dN = toCm((lat - hdr->refLat) * 111320.0);
+    e.dE = toCm((lon - hdr->refLon) * mPerDegLon);
+    e.dU = toCm(alt - hdr->refAlt);
     e.valid = 1;
   } else {
     e.dN = e.dE = e.dU = 0;
@@ -102,12 +112,13 @@ void historyFeed(uint32_t nowMs, uint8_t satsUsed, uint8_t satsTracked,
     e.valid = 2;
   }
 
-  blob.hdr.head = (uint16_t)((blob.hdr.head + 1) % HISTORY_SAMPLES);
-  if (blob.hdr.filled < HISTORY_SAMPLES) blob.hdr.filled++;
+  hdr->head = (uint16_t)((hdr->head + 1) % hdr->count);
+  if (hdr->filled < hdr->count) hdr->filled++;
 }
 
 const uint8_t* historySnapshot(size_t &len) {
-  blob.hdr.uptimeSec = millis() / 1000;
-  len = sizeof(blob);
-  return (const uint8_t*)&blob;
+  if (!blobMem) { len = 0; return nullptr; }
+  hdr->uptimeSec = millis() / 1000;
+  len = blobLen;
+  return blobMem;
 }
