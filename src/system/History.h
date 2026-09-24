@@ -11,8 +11,9 @@
 //
 // The buffer is served as a binary blob rather than JSON. It is 23 kB of
 // fixed-width records; serialising that into text would cost about 58 kB of
-// heap on a device that has ~148 kB free, for no benefit, when the browser can
-// read the records directly.
+// heap for no benefit, when the browser can read the records directly. The
+// records live in instruction RAM, which only allows 32-bit access - see
+// History.cpp - so they are read out through historyRead(), never a pointer.
 
 void historyInit();
 
@@ -25,6 +26,9 @@ void historyFeed(uint32_t nowMs, uint8_t satsUsed, uint8_t satsTracked,
                  bool haveFix, double lat, double lon, double alt,
                  uint32_t bytesSec, float ionoMeanM);
 
-// Pointer to the blob, valid for the lifetime of the program. The header is
-// refreshed on each call.
-const uint8_t* historySnapshot(size_t &len);
+// Size of the blob (header + ring), 0 when history is off.
+size_t historySize();
+
+// Copies up to maxLen bytes of the blob starting at offset into dst and
+// returns the count. The header's uptime is refreshed when offset is 0.
+size_t historyRead(size_t offset, uint8_t *dst, size_t maxLen);

@@ -117,7 +117,7 @@ Carrier-to-noise per band, and C/N0 against elevation — the standard way to sp
 
 <h3>History</h3>
 
-Twelve hours of receiver health, sampled every 30 s, plotted as described in the History section below. Not collected while the Tailscale client is enabled.
+Twelve hours of receiver health, sampled every 30 s, plotted as described in the History section below.
 
 <h3>Terminal</h3>
 
@@ -207,7 +207,7 @@ RTCM 1005 broadcasts the antenna reference point. If you enter the coordinates o
 
 <h2>Ionosphere Monitor</h2>
 
-The Overview panel shows where each satellite's ray crosses the ionosphere, on a fixed ±10° geographic grid centred on the station, coloured by how much the vertical delay has **changed** since that satellite's arc began. It is built from the dual-frequency observations the module already broadcasts: MSM7 is decoded on the device and the geometry-free combination gives an ionospheric delay per satellite. The LC29H tracks GPS L1+L5, Galileo E1+E5a and BeiDou B1I+B2a, which yields roughly twenty usable arcs.
+The Overview panel shows where each satellite's ray crosses the ionosphere, on a fixed ±10° geographic grid centred on the station, coloured by how much the vertical delay has **changed** since that satellite's arc began. It is built from the dual-frequency observations the module already broadcasts: MSM7 is decoded on the device and the geometry-free combination gives an ionospheric delay per satellite. The LC29H tracks GPS L1+L5, Galileo E1+E5a and BeiDou B1I+B2a, which yields roughly twenty usable arcs. The arcs are not on the 1 Hz telemetry frame; the page fetches them from `/api/iono` every 5 s while Overview is open, so the monitor costs nothing when nobody is looking and runs with the Tailscale client enabled too.
 
 Read the limits before trusting it:
 
@@ -376,8 +376,8 @@ The client needs roughly 80 kB at runtime and this board has 320 kB with no PSRA
 
 | | Client off | Client on |
 | --- | --- | --- |
-| History window | 12 hours | not collected |
-| Ionospheric monitor | on | off |
+| History window | 12 hours | 12 hours |
+| Ionospheric monitor | on | on |
 | Simultaneous RTCM consumers | 6 TCP + 6 UDP | 4 + 4 |
 | Telemetry to a LAN browser | 1 Hz | 1 Hz |
 | Telemetry to a tailnet browser | — | up to 1 Hz, paced by the link |
@@ -409,7 +409,7 @@ Every other panel shows the current instant, which is the wrong resolution for w
 
 Both satellite figures are floors rather than exact counts. An NMEA `GSA` sentence carries at most twelve satellites and this module emits one per constellation, so GPS and BeiDou sit at twelve whenever the receiver is using more than that. The receiver's own count in `GGA` field 7 runs higher still — higher than the number of satellites `GSV` reports as tracked — so on this dual-frequency module it is counting signals rather than satellites, and it is deliberately not plotted.
 
-Sampling is every 30 s into a 1440-entry ring, 23 kB of RAM. It is served as a binary blob rather than JSON — the same records as text would have cost roughly 58 kB and the heap to build it — and fetched only when the page is open, so the 1 Hz telemetry stream is untouched.
+Sampling is every 30 s into a 1440-entry ring, 23 kB. The ring lives in the ESP32's IRAM heap, a 29 kB region that ordinary allocations never use because it only allows 32-bit reads and writes, so the history costs the byte-addressable heap nothing and runs in full alongside the Tailscale client. `History.cpp` touches it only a whole word at a time. It is served as a binary blob rather than JSON — the same records as text would have cost roughly 58 kB and the heap to build it — and fetched only when the page is open, so the 1 Hz telemetry stream is untouched.
 
 > The buffer lives in RAM and **starts over on reboot**. It is a monitoring window, not an archive; for a permanent record, log the RTCM stream on a PC with `str2str`.
 

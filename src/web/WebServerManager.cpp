@@ -610,19 +610,50 @@ void setupWebServer() {
                 "reboot", 2048, NULL, 1, NULL);
   });
 
+  // The ionosphere map's pierce points, fetched by the Overview page every few
+  // seconds while it is open instead of riding on every telemetry frame. They
+  // move over minutes, and on the frame they were a fifth of every message to
+  // every browser - enough that the monitor used to be switched off with the
+  // Tailscale client running. Here they cost under 1 kB, only while a page is
+  // asking.
+  // [sysIdx, prn, elev, azim, rawSlant*100, deltaVert*100, arcSeconds, ippLat, ippLon]
+  server.on("/api/iono", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!rt.iono) { request->send(204); return; }
+    AsyncResponseStream *r = request->beginResponseStream("application/json", 1024);
+    r->addHeader("Cache-Control", "no-store");
+    uint32_t nowMs = millis();
+    r->print('[');
+    if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+      for (int i = 0; i < ionoSatCount; i++) {
+        const IonoSat &t = ionoSats[i];
+        r->printf("%s[%d,%d,%d,%d,%ld,%ld,%lu,%.4f,%.4f]", i ? "," : "",
+                  (int)t.sys, (int)t.prn, (int)t.elev, (int)t.azim,
+                  lroundf(t.slantRaw * 100), lroundf(t.vertDelta * 100),
+                  (unsigned long)(t.hasRef ? (nowMs - t.arcStartMs) / 1000 : 0),
+                  (double)t.ippLat, (double)t.ippLon);
+      }
+      xSemaphoreGive(dataMutex);
+    }
+    r->print(']');
+    request->send(r);
+  });
+
   server.on("/api/history", HTTP_GET, [](AsyncWebServerRequest *request){
-    size_t len = 0;
-    const uint8_t *b = historySnapshot(len);
-    if (!b || !len) {   // lean profile: history is not collected
+    size_t len = historySize();
+    if (!len) {   // history could not be allocated
       request->send(204);
       return;
     }
-    // Sent straight from the static buffer. A sample may be rewritten while
-    // the response streams; one record briefly mixing an old and a new field
-    // is invisible on a twelve hour chart, and copying 23 kB to avoid it would
-    // not be.
-    AsyncWebServerResponse *r =
-        request->beginResponse(200, "application/octet-stream", b, len);
+    // Streamed out of the ring in instruction RAM, which only allows 32-bit
+    // access, so historyRead() copies it word by word into the TCP buffer. A
+    // sample may be rewritten while the response streams; one record briefly
+    // mixing an old and a new field is invisible on a twelve hour chart, and
+    // copying 23 kB to avoid it would not be.
+    AsyncWebServerResponse *r = request->beginResponse(
+        "application/octet-stream", len,
+        [](uint8_t *buf, size_t maxLen, size_t index) -> size_t {
+          return historyRead(index, buf, maxLen);
+        });
     r->addHeader("Cache-Control", "no-store");
     request->send(r);
   });
@@ -819,23 +850,6 @@ void handleTelemetry(uint32_t now) {
   }
 
   lastCpuCheckTime = now;
-  if (ws.count() == 0) return;
-
-  // Built once if at least one client can take it. Deliberately not
-  // availableForWriteAll(), which is true only when every client is ready: a
-  // browser reaching the device over the tailnet is relayed and slow, its queue
-  // backs up, and the all-clients test then withheld the frame from the healthy
-  // client on the LAN as well. Opening the second connection killed both.
-  static uint32_t telemSeq = 0, telemSkipped = 0;
-  telemSeq++;
-  bool anyReady = false;
-  for (auto &c : ws.getClients()) {
-    if (c.status() == WS_CONNECTED && c.queueLen() < WS_MAX_INFLIGHT) { anyReady = true; break; }
-  }
-  if (!anyReady) {
-    telemSkipped++;
-    return;
-  }
 
   // ---- snapshot ---------------------------------------------------------
   int sigCount = 0;
@@ -938,6 +952,28 @@ void handleTelemetry(uint32_t now) {
               g.lat, g.lon, g.alt,
               rtcmStats.bytesSec,
               ionoUsable ? dSum / ionoUsable : -1.0f);
+
+  // Everything above runs every second whether or not a browser is open: the
+  // history ring and the ionosphere arcs are sampled here, and a window with a
+  // hole wherever nobody was watching would defeat the point of either. Only
+  // building and sending the frame depends on someone listening.
+  if (ws.count() == 0) return;
+
+  // Built once if at least one client can take it. Deliberately not
+  // availableForWriteAll(), which is true only when every client is ready: a
+  // browser reaching the device over the tailnet is relayed and slow, its queue
+  // backs up, and the all-clients test then withheld the frame from the healthy
+  // client on the LAN as well. Opening the second connection killed both.
+  static uint32_t telemSeq = 0, telemSkipped = 0;
+  telemSeq++;
+  bool anyReady = false;
+  for (auto &c : ws.getClients()) {
+    if (c.status() == WS_CONNECTED && c.queueLen() < WS_MAX_INFLIGHT) { anyReady = true; break; }
+  }
+  if (!anyReady) {
+    telemSkipped++;
+    return;
+  }
 
   RtcmClientInfo tinfo[MAX_TCP_CLIENTS];
   int tn = snapshotTcpClients(tinfo, rt.tcpClients);
@@ -1044,19 +1080,8 @@ void handleTelemetry(uint32_t now) {
     }
   j.end('}');
 
-  // [sysIdx, prn, elev, azim, rawSlant*100, deltaVert*100, arcSeconds, ippLat, ippLon]
-  j.arr("io");
-  for (int i = 0; i < ionoN; i++) {
-    const IonoSat &t = ionoLocal[i];
-    j.comma(); j.put('['); j.first = true;
-      j.el((int)t.sys); j.el((int)t.prn); j.el((int)t.elev); j.el((int)t.azim);
-      j.el((long)lroundf(t.slantRaw * 100));
-      j.el((long)lroundf(t.vertDelta * 100));
-      j.el((unsigned long)(t.hasRef ? (nowMs - t.arcStartMs) / 1000 : 0));
-      j.el((double)t.ippLat, 4); j.el((double)t.ippLon, 4);
-    j.end(']');
-  }
-  j.end(']');
+  // The per-satellite arcs are served by /api/iono; the frame carries only the
+  // summary.
   j.kv("ion",  ionoUsable);
   j.kv("iond", ionoUsable ? (double)dSum / ionoUsable : 0.0, 3);
 

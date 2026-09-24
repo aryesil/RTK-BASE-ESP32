@@ -1086,9 +1086,11 @@ const SVIN_V  = ['Invalid','In progress','Valid'];
 const JAM_TXT = ['unknown','clean','warning','critical'];
 
 let D = null, page = 'overview';
-// The device sends the satellite and ionosphere arrays every other tick to keep
-// frames small; carry the last ones forward on the ticks that omit them.
-let lastSig = [], lastIo = [], lastRx = 0, rxGap = 1, staleTimer = null;
+// The device sends the satellite array every other tick to keep frames small;
+// carry the last one forward on the ticks that omit it.
+let lastSig = [], lastRx = 0, rxGap = 1, staleTimer = null;
+// Ionosphere pierce points, fetched from /api/iono while Overview is open.
+let ioArcs = [], ioAt = 0, ioBusy = false;
 let baseFormLoaded = false, outFormLoaded = false, netFormLoaded = false;
 let tsFormLoaded = false, termLines = [];
 let scatter = [];   // {e, n, h} in metres relative to the running mean
@@ -1227,7 +1229,6 @@ function onMessage(ev){
   let n;
   try { n = JSON.parse(s); } catch(e){ return; }
   if(n.sig) lastSig = n.sig; else n.sig = lastSig;
-  if(n.io)  lastIo  = n.io;  else n.io  = lastIo;
   D = n;
   const t = Date.now();
   if(lastRx){
@@ -1432,6 +1433,7 @@ function renderOverview(){
 
   pushScatter();
   drawScatter();
+  loadIono();
   drawIono();
 }
 
@@ -2290,12 +2292,23 @@ function ionoColour(d, span){
   return `rgba(${Math.round(60 + 20 * -t)},${Math.round(120 - 10 * -t)},${Math.round(120 + 115 * -t)},0.95)`;
 }
 
+// The arcs change over minutes; every 5 s is plenty and keeps them off the
+// 1 Hz telemetry frame.
+function loadIono(){
+  if(ioBusy || Date.now() - ioAt < 5000) return;
+  ioBusy = true;
+  fetch('/api/iono').then(r => r.status === 200 ? r.json() : [])
+    .then(a => { ioArcs = a; ioAt = Date.now(); drawIono(); })
+    .catch(() => { ioAt = Date.now(); })
+    .finally(() => { ioBusy = false; });
+}
+
 function drawIono(){
   const hp = hidpi($('iono')); if(!hp) return;
   const {ctx, W, H} = hp;
   ctx.clearRect(0, 0, W, H);
 
-  const arcs = (D.io || []).filter(a => a[2] > 0 && a[6] > 0 && (a[7] || a[8]));
+  const arcs = ioArcs.filter(a => a[2] > 0 && a[6] > 0 && (a[7] || a[8]));
   if(!arcs.length || !D.vloc){
     ctx.fillStyle = '#9aa8b5'; ctx.font = '12px Arial'; ctx.textAlign = 'center';
     ctx.fillText('Waiting for pierce points', W/2, H/2);

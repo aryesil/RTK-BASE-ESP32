@@ -1,5 +1,7 @@
 #include <system/History.h>
 #include <math.h>
+#include <esp_heap_caps.h>
+#include <esp_memory_utils.h>
 
 // Wire format. Offsets are fixed and the browser reads them directly, so the
 // padding here is explicit rather than left to the compiler.
@@ -31,32 +33,72 @@ struct HistSample {
   uint8_t  tracked;   // 15  satellites being tracked (from GSV)
 };                    // 16
 
-/* Header and ring in one allocation so the whole thing can be served as a
- * single response, sized at boot from rt.historySamples. */
-static uint8_t   *blobMem = nullptr;
-static HistHeader *hdr    = nullptr;
-static HistSample *ring   = nullptr;
-static size_t     blobLen = 0;
-static uint32_t lastSampleMs = 0;
-static bool     haveRef = false;
-
 static_assert(sizeof(HistHeader) == 48, "header layout changed");
 static_assert(sizeof(HistSample) == 16, "sample layout changed");
 
+/* The ring lives in instruction RAM. The ESP32 keeps about 29 kB of IRAM as a
+ * heap that ordinary malloc() never hands out, because it can only be read and
+ * written 32 bits at a time: a byte or halfword access raises LoadStoreError.
+ * Nothing else in this firmware uses it, and the ring is 23 kB, so the full
+ * twelve hours fit there with the Tailscale client running and cost the
+ * byte-addressable heap nothing. The rule that makes it safe: the ring is
+ * touched only through ringPut() and historyRead() below, whole aligned words
+ * each, never through a HistSample pointer. The header is small and stays in
+ * ordinary RAM. If IRAM is unavailable the ring falls back to ordinary RAM,
+ * but only when the Tailscale client is off - with it on, that RAM is the
+ * client's. */
+union SampleWords {
+  HistSample s;
+  uint32_t   w[sizeof(HistSample) / 4];
+};
+
+static HistHeader hdrMem;
+static HistHeader *hdr     = nullptr;
+static uint32_t  *ringMem  = nullptr;   // IRAM (or DRAM fallback), words only
+static size_t     ringBytes = 0;
+static size_t     blobLen  = 0;
+static uint32_t lastSampleMs = 0;
+static bool     haveRef = false;
+
+static void ringPut(uint16_t slot, const SampleWords &e) {
+  volatile uint32_t *dst = ringMem + (size_t)slot * (sizeof(HistSample) / 4);
+  for (size_t i = 0; i < sizeof(HistSample) / 4; i++) dst[i] = e.w[i];
+}
+
 void historyInit() {
   uint16_t n = rt.historySamples;
-  if (n == 0) return;              // lean profile: no history at all
-  blobLen = sizeof(HistHeader) + (size_t)n * sizeof(HistSample);
-  blobMem = (uint8_t *)calloc(1, blobLen);
-  if (!blobMem) {                       // no history rather than no boot
-    blobLen = 0;
+  if (n == 0) return;
+  ringBytes = (size_t)n * sizeof(HistSample);
+  // An executable allocation can also be served from the IRAM alias of a
+  // region shared with data RAM, which would cost the byte-addressable heap
+  // after all. Only a block that leaves that heap untouched counts as IRAM.
+  size_t freeBefore = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  ringMem = (uint32_t *)heap_caps_malloc(ringBytes, MALLOC_CAP_EXEC | MALLOC_CAP_32BIT);
+  bool inIram = ringMem && !esp_ptr_byte_accessible(ringMem) &&
+                heap_caps_get_free_size(MALLOC_CAP_8BIT) + 1024 >= freeBefore;
+  if (ringMem && !inIram && rt.lean) {
+    heap_caps_free(ringMem);
+    ringMem = nullptr;
+  }
+  if (!ringMem && !rt.lean) ringMem = (uint32_t *)malloc(ringBytes);
+  if (ringMem) {
+    volatile uint32_t *w = ringMem;
+    for (size_t i = 0; i < ringBytes / 4; i++) w[i] = 0;   // calloc would memset bytes
+  }
+  if (!ringMem) {                       // no history rather than no boot
+    Log.printf("[HIST] No room for %u samples, history off\n", (unsigned)n);
+    rt.historySamples = 0;
+    ringBytes = 0;
     return;
   }
-  hdr  = (HistHeader *)blobMem;
-  ring = (HistSample *)(blobMem + sizeof(HistHeader));
+  Log.printf("[HIST] %u samples, %u bytes in %s\n", (unsigned)n, (unsigned)ringBytes,
+             inIram ? "IRAM" : "RAM");
+  hdr = &hdrMem;
+  memset(hdr, 0, sizeof(*hdr));
   hdr->magic       = 0x484B5452;   // 'RTKH' little-endian
   hdr->count       = n;
   hdr->intervalSec = HISTORY_INTERVAL_MS / 1000;
+  blobLen = sizeof(HistHeader) + ringBytes;
   lastSampleMs = 0;
   haveRef = false;
 }
@@ -75,7 +117,7 @@ void historyFeed(uint32_t nowMs, uint8_t satsUsed, uint8_t satsTracked,
                  uint8_t fixQual, uint8_t jamL1, uint8_t jamL5,
                  bool haveFix, double lat, double lon, double alt,
                  uint32_t bytesSec, float ionoMeanM) {
-  if (!blobMem) return;
+  if (!ringMem) return;
   if (lastSampleMs && (nowMs - lastSampleMs) < HISTORY_INTERVAL_MS) return;
   lastSampleMs = nowMs;
 
@@ -89,7 +131,8 @@ void historyFeed(uint32_t nowMs, uint8_t satsUsed, uint8_t satsTracked,
     haveRef = true;
   }
 
-  HistSample &e = ring[hdr->head];
+  SampleWords w = {};
+  HistSample &e = w.s;
   e.sats    = satsUsed;
   e.tracked = satsTracked;
   e.cn0   = meanCn0;
@@ -112,13 +155,33 @@ void historyFeed(uint32_t nowMs, uint8_t satsUsed, uint8_t satsTracked,
     e.valid = 2;
   }
 
+  ringPut(hdr->head, w);
   hdr->head = (uint16_t)((hdr->head + 1) % hdr->count);
   if (hdr->filled < hdr->count) hdr->filled++;
 }
 
-const uint8_t* historySnapshot(size_t &len) {
-  if (!blobMem) { len = 0; return nullptr; }
-  hdr->uptimeSec = millis() / 1000;
-  len = blobLen;
-  return blobMem;
+size_t historySize() {
+  return ringMem ? blobLen : 0;
+}
+
+size_t historyRead(size_t offset, uint8_t *dst, size_t maxLen) {
+  if (!ringMem || offset >= blobLen) return 0;
+  if (offset == 0) hdr->uptimeSec = millis() / 1000;
+  size_t n = blobLen - offset;
+  if (n > maxLen) n = maxLen;
+  size_t done = 0;
+  // Header from ordinary RAM.
+  while (done < n && offset + done < sizeof(HistHeader)) {
+    dst[done] = ((const uint8_t *)hdr)[offset + done];
+    done++;
+  }
+  // Ring a word at a time; the response buffer is ordinary RAM, so bytes are
+  // picked out of each word there.
+  while (done < n) {
+    size_t r = offset + done - sizeof(HistHeader);
+    uint32_t word = ((volatile const uint32_t *)ringMem)[r / 4];
+    for (size_t b = r % 4; b < 4 && done < n; b++, done++)
+      dst[done] = (uint8_t)(word >> (8 * b));
+  }
+  return done;
 }

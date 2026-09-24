@@ -24,7 +24,6 @@ void setup() {
         rt.tcpClients     = LEAN_TCP_CLIENTS;
         rt.udpClients     = LEAN_UDP_CLIENTS;
         rt.telemetryBuf   = LEAN_TELEMETRY_BUF;
-        rt.iono           = false;
     }
 
     initBaseConfig();
