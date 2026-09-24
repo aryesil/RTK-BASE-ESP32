@@ -4,7 +4,7 @@
 ESP32-based RTK (Real-Time Kinematic) base station for GNSS correction data streaming over TCP, NTRIP and UDP.
 
 <h2>Overview</h2>
-This project turns an ESP32 into a networked RTK base station. It receives RTCM3 and NMEA from a multi-constellation GNSS receiver, reassembles and CRC-checks every correction frame, and serves it to rovers four different ways at once: a raw TCP stream, an NTRIP caster, UDP, and an outbound push to a remote caster. A seven-page web interface provides live telemetry over WebSocket — position, fix quality, sky view, signal distribution, interference status, survey-in progress and an ionospheric monitor — and the device runs its own access point so the rover never has to go through a router.
+This project turns an ESP32 into a networked RTK base station. It receives RTCM3 and NMEA from a multi-constellation GNSS receiver, reassembles and CRC-checks every correction frame, and serves it to rovers four different ways at once: a raw TCP stream, an NTRIP caster, UDP, and an outbound push to a remote caster. An eight-page web interface provides live telemetry over WebSocket — position, fix quality, sky view, signal distribution, interference status, survey-in progress, an ionospheric monitor and a twelve hour history — and the device runs its own access point so the rover never has to go through a router.
 
 ![Overview](docs/img/overview.png)
 
@@ -83,7 +83,7 @@ There is no separate WiFi setup page; the full interface is served from the firs
 
 <h2>Web Interface</h2>
 
-Seven tabs, served entirely from flash with no CDN and no internet access required.
+Eight tabs, served entirely from flash with no CDN and no internet access required.
 
 <h3>Overview</h3>
 
@@ -114,6 +114,10 @@ Carrier-to-noise per band, and C/N0 against elevation — the standard way to sp
 <h3>Network</h3>
 
 ![Network](docs/img/network.png)
+
+<h3>History</h3>
+
+Twelve hours of receiver health, sampled every 30 s, plotted as described in the History section below. Not collected while the Tailscale client is enabled.
 
 <h3>Terminal</h3>
 
