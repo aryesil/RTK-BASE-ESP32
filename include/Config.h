@@ -107,13 +107,14 @@
 #define LEAN_TELEMETRY_BUF   5120   // lean frame measures about 3.2 kB
 #define FULL_TELEMETRY_BUF   10240
 
-// Telemetry cadence for a browser reached over the tailnet. The tunnel has a
-// smaller MTU and far more latency than the LAN, and a 3.3 kB frame every
-// second does not drain before the next one is due - the queue stays full and
-// the client receives nothing at all. Five seconds is plenty for a management
-// view; the LAN keeps its 1 Hz.
-#define TELEMETRY_TAILNET_MS 5000
+// Most WebSocket messages allowed in flight to one browser before it is
+// skipped. A message leaves the queue only once TCP has it acknowledged, so
+// this is backpressure per link: a LAN browser acknowledges within
+// milliseconds and gets every 1 Hz frame, a browser behind the tunnel gets as
+// many as its round trip can carry, and a stalled one simply receives fewer
+// rather than building a queue. It replaces a fixed 5 s tailnet cadence.
+#define WS_MAX_INFLIGHT 2
 
 #define AP_SSID   "ESP32_RTK_BASE"
 #define RX_MODEL  "LC29H (BS)"
-#define FW_VERSION "1.3.0"
+#define FW_VERSION "1.3.1"

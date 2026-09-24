@@ -53,13 +53,20 @@ cd RTK-BASE-ESP32
 pio run -t upload
 ```
 
-Dependencies are resolved automatically: `ArduinoJson`, `ESPAsyncWebServer`, `AsyncTCP`, `TinyGPSPlus`.
+The build uses Arduino 3.2.1 as a component of ESP-IDF 5.4.2 through the [pioarduino](https://github.com/pioarduino/platform-espressif32) platform (`framework = arduino, espidf`), so ESP-IDF options come from `sdkconfig.defaults`. Use PlatformIO Core 6.1.x: 6.2 ships an SCons that this platform release does not build with (`No module named 'SCons.Tool.FortranCommon'`).
+
+```bash
+~/.platformio/penv/bin/pip install platformio==6.1.18
+```
+
+Dependencies are resolved automatically: `ArduinoJson`, `ESPAsyncWebServer`, `AsyncTCP`, `TinyGPSPlus`. After they are installed, `tools/patch_libs.py` fixes a WebSocket framing bug in ESPAsyncWebServer (described under Tailscale below); it stops the build if a library update moves the code it patches rather than building without the fix.
 
 `platformio.ini` pins the AsyncTCP task to core 0, so HTTP and WebSocket work can never land on the core that forwards corrections:
 
 ```ini
 build_flags =
     -D CONFIG_ASYNC_TCP_RUNNING_CORE=0
+extra_scripts = pre:tools/patch_libs.py
 ```
 
 OTA updates are available; the device advertises itself as `ESP32-RTK-BASE` and OTA is serviced in every network state.
@@ -300,18 +307,29 @@ CORE 1 (loopTask)                          CORE 0 (NetworkTask, 20 ms)
  RTCM 1005 / MSM7 decode                    telemetry JSON at 1 Hz
  fan-out: TCP, NTRIP, UDP                   WebSocket queue drain
  NMEA parse: GGA, GSA, GSV                  AsyncTCP (HTTP / WS)
+                                            lwIP TCP/IP thread
+                                            Tailscale: control, relay,
+                                            UDP I/O, WireGuard manager
 ```
 
 Core 1 is reserved for the correction path. Client housekeeping — accepting connections, NTRIP handshakes, UDP registration — is polled at 20 ms rather than every loop iteration, because each of those calls is an lwIP socket operation and at 1 ms they consumed thousands of syscalls a second on the core that has to stay deterministic. The RTCM send path itself is never throttled.
 
 Shared state is guarded by three mutexes: `dataMutex` for the satellite and position snapshot, `tcpMutex` for the output sockets, `baseMutex` for the module configuration mirror. Sentence parsers write to staging variables owned by core 1 and publish under lock, so no lock is taken inside the byte loop.
 
-Measured on an ESP32-WROOM-32D tracking 39 satellites: **2 % load on each core**, 21 % of RAM, 78 % of the 1.25 MB application partition, 11 RTCM frames per second at about 1.1 kB/s with zero CRC errors.
+The WireGuard manager and the lwIP thread share the tunnel's state, so every call into WireGuard holds the lwIP core lock (`CONFIG_LWIP_TCPIP_CORE_LOCKING`); decrypted packets enter the stack through the TCP/IP thread like any other.
+
+Measured on an ESP32-WROOM-32D tracking 41 satellites with the Tailscale client connected and three browsers open: **2 % load on core 0 and 5 % on core 1**, 17 % of RAM statically allocated with about 40 kB of heap left free at runtime, 72 % of the 1.9 MB application partition, 11 RTCM frames per second at about 1.1 kB/s.
 
 <h2>Project Structure</h2>
 
 ````markdown
 ├── platformio.ini              # Build configuration (env: esp32-dev)
+├── sdkconfig.defaults          # ESP-IDF options (memory, lwIP, mbedTLS, microlink)
+├── min_spiffs.csv              # Partition table: two OTA slots
+├── components/
+│   ├── microlink/              # Tailscale client, vendored and modified (VENDORED.md)
+│   ├── wireguard_lwip/         # WireGuard on lwIP, used by microlink
+│   └── espressif__esp_*/       # Stubs for Arduino dependencies that do not build
 ├── include/
 │   ├── Config.h                # Pin definitions, baud rate, ports, limits
 │   └── Globals.h               # Global state, structs and FreeRTOS handles
@@ -327,14 +345,17 @@ Measured on an ESP32-WROOM-32D tracking 39 satellites: **2 % load on each core**
 │   ├── network/
 │   │   ├── NetworkManager.cpp  # Access point, optional station uplink, OTA
 │   │   ├── DataOutput.cpp      # TCP raw, NTRIP caster, UDP fan-out
-│   │   └── NtripPush.cpp       # Outbound NTRIP server to a remote caster
+│   │   ├── NtripPush.cpp       # Outbound NTRIP server to a remote caster
+│   │   └── Tailscale.cpp       # Tailscale client start-up and status
 │   ├── system/
-│   │   └── SystemManager.cpp   # UART setup, semaphores, queues, PPS ISR
+│   │   ├── SystemManager.cpp   # UART setup, semaphores, queues, PPS ISR
+│   │   └── History.cpp         # Twelve hour history ring
 │   └── web/
 │       ├── WebServerManager.cpp# HTTP routes, API endpoints, telemetry JSON
 │       └── WebUI.h             # The entire interface, served from flash
 ├── tools/
-│   └── mock_ui.py              # Run the interface without hardware
+│   ├── mock_ui.py              # Run the interface without hardware
+│   └── patch_libs.py           # Fixes applied to installed libraries at build time
 └── docs/img/                   # Interface screenshots
 
 ````
@@ -355,11 +376,17 @@ The client needs roughly 80 kB at runtime and this board has 320 kB with no PSRA
 | Ionospheric monitor | on | off |
 | Simultaneous RTCM consumers | 6 TCP + 6 UDP | 4 + 4 |
 | Telemetry to a LAN browser | 1 Hz | 1 Hz |
-| Telemetry to a tailnet browser | — | every 5 s |
+| Telemetry to a tailnet browser | — | up to 1 Hz, paced by the link |
 
 Everything else is identical: all four RTCM transports, the NTRIP push, survey-in and fixed configuration, the sky plot and the carrier-to-noise charts, the rover back channel. Changing the setting requires a reboot, which is what makes one decision at startup enough.
 
-A browser reached through the tunnel gets a slower cadence deliberately. The tunnel has a smaller MTU and far more latency than the LAN, and a 3.3 kB frame every second does not drain before the next is due - the queue stays full and that client receives nothing at all.
+Every browser is paced by its own link. A WebSocket message leaves the device's queue only when TCP has it acknowledged, and a browser with two frames still unacknowledged skips the next one: on the LAN that never happens, across the tunnel it happens only while the path is actually slow, and a stall costs frames rather than the connection. The page judges "link slow" against the cadence it is actually receiving.
+
+The WebSocket library shipped with a bug that only shows when memory is short, which with the tailnet client running is most of the time: a frame whose payload could not be queued after its header already had been was sent again from the start, header and all. The browser read a header inside a payload, declared the stream corrupt and closed the connection, on the LAN as much as over the tunnel. `tools/patch_libs.py` fixes it in the installed library on every build, and fails the build if a library update moves the code it patches.
+
+The client measures its relay at boot: one STUN request to every Tailscale DERP region, and the nearest becomes its home. Peers that cannot reach the device directly go through that relay, so from Europe this is tens of milliseconds instead of the round trip to Dallas it used to be hard-wired to.
+
+The device sets its clock over NTP when the client starts. WireGuard stamps every handshake with the time, and a peer ignores one older than the last it saw from the same key, which after a reboot is what an uptime counter produces. With the real time the device can open sessions itself, and when a peer is still talking on a session from before a restart the device answers with a fresh handshake at once instead of leaving it to time out after 15 seconds.
 
 > The client is started once and never stopped. Its shutdown path blocks for three seconds and cannot reliably reclaim its task stacks, so restarting it in place would both stall the base station and leak about 29 kB each time.
 
@@ -396,7 +423,9 @@ Restoring applies every field present in the file and reboots; anything the file
 <h3>Open access point by default</h3>  Change it on the Network tab before deploying anywhere real.
 <h3>Survey-in is not a survey</h3>  Decimetre absolute accuracy at best. Post-process for centimetre work.
 <h3>GLONASS is single-frequency</h3>  On this module it contributes no ionospheric measurements.
-<h3>Consumer limits</h3>  Six simultaneous TCP/NTRIP consumers and six UDP subscribers; beyond that the caster answers `503`.
+<h3>Consumer limits</h3>  Six simultaneous TCP/NTRIP consumers and six UDP subscribers; beyond that the caster answers `503`. Four and four with the Tailscale client enabled.
+<h3>Tailscale relay certificate is not verified</h3>  The client does not check the DERP relay's TLS certificate. Tunnel traffic is WireGuard-encrypted end to end, so a false relay cannot read or alter it, but it could drop it.
+<h3>Tailscale after a reboot</h3>  The tunnel is back a few seconds after the client reconnects. An open page notices the old connection is gone only when its own timeout runs out, so it takes a little longer to recover than the device does.
 
 <h2>Acknowledgements</h2>
 

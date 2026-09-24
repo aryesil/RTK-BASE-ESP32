@@ -1088,7 +1088,7 @@ const JAM_TXT = ['unknown','clean','warning','critical'];
 let D = null, page = 'overview';
 // The device sends the satellite and ionosphere arrays every other tick to keep
 // frames small; carry the last ones forward on the ticks that omit them.
-let lastSig = [], lastIo = [], lastRx = 0, staleTimer = null;
+let lastSig = [], lastIo = [], lastRx = 0, rxGap = 1, staleTimer = null;
 let baseFormLoaded = false, outFormLoaded = false, netFormLoaded = false;
 let tsFormLoaded = false, termLines = [];
 let scatter = [];   // {e, n, h} in metres relative to the running mean
@@ -1186,6 +1186,7 @@ function initWs(){
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   sock = new WebSocket(`${proto}://${location.host}/ws`);
   sock.onopen = () => {
+    lastRx = 0;
     $('link').innerHTML = '&#9679; connected';
     $('link').style.color = '#2e7d32';
     log('sy', 'Connection established.');
@@ -1204,7 +1205,10 @@ function initWs(){
   staleTimer = setInterval(() => {
     if(!lastRx || sock.readyState !== 1) return;
     const age = (Date.now() - lastRx) / 1000;
-    if(age > 2.5){
+    // Against this link's own cadence rather than a flat 2.5 s: the device
+    // paces each browser by how fast its link acknowledges, so a browser
+    // across the tunnel legitimately sees longer gaps than one on the LAN.
+    if(age > Math.max(2.5, 2.5 * rxGap)){
       $('link').innerHTML = '&#9679; link slow, ' + age.toFixed(0) + ' s';
       $('link').style.color = '#b8860b';
     }
@@ -1225,7 +1229,12 @@ function onMessage(ev){
   if(n.sig) lastSig = n.sig; else n.sig = lastSig;
   if(n.io)  lastIo  = n.io;  else n.io  = lastIo;
   D = n;
-  lastRx = Date.now();
+  const t = Date.now();
+  if(lastRx){
+    const gap = Math.min((t - lastRx) / 1000, 10);
+    rxGap = rxGap * 0.8 + gap * 0.2;
+  }
+  lastRx = t;
   $('link').innerHTML = '&#9679; connected';
   $('link').style.color = '#2e7d32';
   render();

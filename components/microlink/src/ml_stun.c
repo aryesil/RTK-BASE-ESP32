@@ -68,7 +68,14 @@ static uint32_t stun_fingerprint(const uint8_t *data, size_t len) {
  * STUN Request Builder (Tailscale-compatible: SOFTWARE + FINGERPRINT)
  * ========================================================================== */
 
+static size_t build_stun_request_txid(uint8_t *out, const uint8_t *txid);
+
 static size_t build_stun_request(uint8_t *out, uint8_t *txid_out) {
+    esp_fill_random(txid_out, 12);
+    return build_stun_request_txid(out, txid_out);
+}
+
+static size_t build_stun_request_txid(uint8_t *out, const uint8_t *txid) {
     size_t pos = 0;
 
     /* Message Type: Binding Request (0x0001) */
@@ -86,9 +93,8 @@ static size_t build_stun_request(uint8_t *out, uint8_t *txid_out) {
     out[pos++] = 0xA4;
     out[pos++] = 0x42;
 
-    /* Transaction ID: 12 random bytes */
-    esp_fill_random(txid_out, 12);
-    memcpy(out + pos, txid_out, 12);
+    /* Transaction ID */
+    memcpy(out + pos, txid, 12);
     pos += 12;
 
     /* SOFTWARE attribute (type 0x8022) */
@@ -347,6 +353,28 @@ esp_err_t ml_stun_send_probe_to(microlink_t *ml, uint32_t server_ip, uint16_t po
     microlink_ip_to_str(server_ip, ip_str);
     ESP_LOGI(TAG, "STUN probe sent to %s:%u (%d bytes)", ip_str, port, (int)req_len);
     return ESP_OK;
+}
+
+/* Latency probe with a caller-chosen transaction ID. Sent from the DISCO socket
+ * like every other IPv4 probe, and deliberately leaves txid_v4 alone so the
+ * regular mapping probe in flight is not invalidated. */
+esp_err_t ml_stun_send_probe_txid(microlink_t *ml, uint32_t server_ip, uint16_t port,
+                                  const uint8_t *txid) {
+    if (server_ip == 0) return ESP_ERR_INVALID_ARG;
+    int sock = ml->disco_sock4;
+    if (sock < 0) {
+        if (ensure_stun_socket(ml) != ESP_OK) return ESP_FAIL;
+        sock = ml->stun_sock;
+    }
+    struct sockaddr_in dest = {
+        .sin_family = AF_INET,
+        .sin_port = htons(port),
+        .sin_addr.s_addr = htonl(server_ip),
+    };
+    uint8_t request[STUN_REQUEST_SIZE];
+    size_t req_len = build_stun_request_txid(request, txid);
+    int n = ml_sendto(sock, request, req_len, 0, (struct sockaddr *)&dest, sizeof(dest));
+    return n < 0 ? ESP_FAIL : ESP_OK;
 }
 
 /* ============================================================================

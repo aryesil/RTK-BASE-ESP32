@@ -119,6 +119,8 @@ err_t wireguardif_remove_peer(struct netif *netif, u8_t peer_index);
 
 // Update the "connect" IP of the given peer
 err_t wireguardif_update_endpoint(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, u16_t port);
+// Switch a live session to a new endpoint without a new handshake
+err_t wireguardif_roam_endpoint(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, u16_t port);
 
 // Try and connect to the given peer
 err_t wireguardif_connect(struct netif *netif, u8_t peer_index);

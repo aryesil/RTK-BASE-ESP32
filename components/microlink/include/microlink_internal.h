@@ -78,8 +78,10 @@ extern "C" {
 /* Queue depths */
 #define ML_DERP_TX_QUEUE_DEPTH  16
 #define ML_DISCO_RX_QUEUE_DEPTH 8
-#define ML_WG_RX_QUEUE_DEPTH    8
-#define ML_STUN_RX_QUEUE_DEPTH  4
+#define ML_WG_RX_QUEUE_DEPTH    12
+/* 8: the DERP latency sweep answers from every region within a few hundred
+ * milliseconds of each other. */
+#define ML_STUN_RX_QUEUE_DEPTH  8
 #define ML_COORD_CMD_QUEUE_DEPTH 4
 #define ML_PEER_UPDATE_QUEUE_DEPTH 400
 
@@ -280,6 +282,7 @@ typedef struct {
     /* Best direct path */
     uint32_t best_ip;
     uint16_t best_port;
+    uint32_t best_rtt_ms;           /* RTT of the last pong on best_ip:port */
     bool has_direct_path;
 
     /* WireGuard peer index in wireguard-lwip */
@@ -287,6 +290,10 @@ typedef struct {
 
     /* On-demand handshake: tried once on first DISCO direct path discovery */
     bool tried_initial_handshake;
+
+    /* Last handshake started because the peer sent data on a session we do
+     * not have (it outlived our reboot); rate-limits those to one per 5 s */
+    uint64_t stale_hs_ms;
 } ml_peer_t;
 
 /* ============================================================================
@@ -503,6 +510,8 @@ void ml_wg_mgr_update_transport(microlink_t *ml);
 esp_err_t ml_stun_resolve_servers(microlink_t *ml);
 esp_err_t ml_stun_send_probe(microlink_t *ml, const char *server, uint16_t port);
 esp_err_t ml_stun_send_probe_to(microlink_t *ml, uint32_t server_ip, uint16_t port);
+esp_err_t ml_stun_send_probe_txid(microlink_t *ml, uint32_t server_ip, uint16_t port,
+                                  const uint8_t *txid);
 esp_err_t ml_stun_send_probe_ipv6(microlink_t *ml, const uint8_t *server_ip6, uint16_t port);
 bool ml_stun_parse_response(const uint8_t *data, size_t len,
                              uint32_t *out_ip, uint16_t *out_port);

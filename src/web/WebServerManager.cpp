@@ -8,6 +8,9 @@
 #include <network/NtripPush.h>
 #include <network/Tailscale.h>
 #include <microlink.h>
+#include <esp_heap_caps.h>
+#include <memory>
+#include <vector>
 #include <stdarg.h>
 #include <gnss/Iono.h>
 #include <system/History.h>
@@ -127,6 +130,15 @@ struct JBuf {
 }  // namespace
 
 void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
+  if (type == WS_EVT_CONNECT) {
+    // The library's default answer to a full queue is to close the socket.
+    // Over the tunnel a queue fills whenever the path stalls for a few
+    // seconds, and closing it is what the page reported as the connection
+    // dropping and coming back. Every send below checks the queue first, so
+    // this is only a backstop - but the right one is to drop a message.
+    client->setCloseClientOnQueueFull(false);
+    return;
+  }
   if (type == WS_EVT_DATA) {
     AwsFrameInfo *info = (AwsFrameInfo*)arg;
     // Only act on a complete, unfragmented text frame; forwarding a partial
@@ -729,15 +741,28 @@ void handleWebSocketQueue() {
     ws.cleanupClients();
   }
 
+  // Per client rather than textAll(). The periodic status lines arrive three
+  // a second and are hidden on the page unless asked for; sent regardless,
+  // they filled a slow client's queue on their own and crowded out the
+  // telemetry frame behind them. They go only to a client with nothing
+  // waiting. Command replies are rarer and wanted, so they go unless the
+  // queue is actually full.
   char queuedMsg[TERM_MSG_LEN];
   while (xQueueReceive(termQueue, queuedMsg, 0) == pdTRUE) {
-    if (ws.count() > 0) {
-      size_t len = strlen(queuedMsg);
-      AsyncWebSocketMessageBuffer * buffer = ws.makeBuffer(len);
-      if (buffer) {
-          memcpy(buffer->get(), queuedMsg, len);
-          ws.textAll(buffer);
+    if (ws.count() == 0) continue;
+    size_t len = strlen(queuedMsg);
+    bool periodic = strncmp(queuedMsg, "TERMP:", 6) == 0;
+    AsyncWebSocketSharedBuffer buf;   // one copy, shared by every client
+    for (auto &c : ws.getClients()) {
+      if (c.status() != WS_CONNECTED) continue;
+      if (periodic ? c.queueLen() > 0 : c.queueIsFull()) continue;
+      if (!buf) {
+        if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < len + 256) break;
+        buf = std::make_shared<std::vector<uint8_t>>((const uint8_t *)queuedMsg,
+                                                     (const uint8_t *)queuedMsg + len);
+        if (!buf) break;
       }
+      c.text(buf);
     }
   }
 }
@@ -805,7 +830,7 @@ void handleTelemetry(uint32_t now) {
   telemSeq++;
   bool anyReady = false;
   for (auto &c : ws.getClients()) {
-    if (c.status() == WS_CONNECTED && !c.queueIsFull()) { anyReady = true; break; }
+    if (c.status() == WS_CONNECTED && c.queueLen() < WS_MAX_INFLIGHT) { anyReady = true; break; }
   }
   if (!anyReady) {
     telemSkipped++;
@@ -1189,26 +1214,23 @@ void handleTelemetry(uint32_t now) {
   j.put('}');
   size_t jsonLen = j.n;
 
-  // Per client, so one backed-up link cannot stall the others, and slower for
-  // anything arriving through the tunnel.
-  static uint32_t lastTailnetMs = 0;
-  bool tailnetDue = (nowMs - lastTailnetMs) >= TELEMETRY_TAILNET_MS;
-  bool sentTailnet = false;
-
+  // Per client, so one backed-up link cannot stall the others. A client with
+  // WS_MAX_INFLIGHT frames still unacknowledged skips this one; the LAN never
+  // gets there, the tunnel does only while its path is actually slow.
+  AsyncWebSocketSharedBuffer wsBuf;   // one copy of the frame for every client
   for (auto &c : ws.getClients()) {
     if (c.status() != WS_CONNECTED) continue;
-
-    // 100.64.0.0/10 is the CGNAT range Tailscale assigns.
-    IPAddress rip = c.remoteIP();
-    bool viaTailnet = (rip[0] == 100 && rip[1] >= 64 && rip[1] <= 127);
-    if (viaTailnet && !tailnetDue) continue;
-
-    if (c.queueIsFull()) { telemSkipped++; continue; }
-    AsyncWebSocketMessageBuffer *wsBuf = ws.makeBuffer(jsonLen);
-    if (!wsBuf) { telemSkipped++; break; }   // out of heap: stop, do not retry
-    memcpy(wsBuf->get(), jsonBuffer, jsonLen);
+    if (c.queueLen() >= WS_MAX_INFLIGHT) { telemSkipped++; continue; }
+    if (!wsBuf) {
+      // make_shared cannot report failure without exceptions; it aborts.
+      if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < jsonLen + 256) {
+        telemSkipped++;
+        break;
+      }
+      wsBuf = std::make_shared<std::vector<uint8_t>>((const uint8_t *)jsonBuffer,
+                                                     (const uint8_t *)jsonBuffer + jsonLen);
+      if (!wsBuf) { telemSkipped++; break; }   // out of heap: stop, do not retry
+    }
     c.text(wsBuf);
-    if (viaTailnet) sentTailnet = true;
   }
-  if (sentTailnet) lastTailnetMs = nowMs;
 }

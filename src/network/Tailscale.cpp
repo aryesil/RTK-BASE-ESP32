@@ -1,6 +1,7 @@
 #include <network/Tailscale.h>
 #include <microlink.h>
 #include <microlink_internal.h>
+#include <esp_log.h>
 
 static Preferences tsPrefs;
 static microlink_t *ml = nullptr;
@@ -46,6 +47,17 @@ void saveTailscaleCfg() {
 
 void initTailscale() {
   loadTailscaleCfg();
+
+  // microlink narrates at INFO: DISCO pings, STUN results, map updates. Worth
+  // having while bringing it up, noise once it runs next to a base station
+  // whose console is also its diagnostics port. Warnings and errors still
+  // come through.
+  static const char *const ML_TAGS[] = {
+    "microlink", "ml_coord", "ml_derp", "ml_h2", "ml_net_io", "ml_noise",
+    "ml_peer_nvs", "ml_stun", "ml_tcp", "ml_udp", "ml_wg_mgr", "ml_zc",
+    "wireguardif"
+  };
+  for (const char *tag : ML_TAGS) esp_log_level_set(tag, ESP_LOG_WARN);
 
   // Claimed now, during setup(), and held for the life of the program. The
   // MapResponse needs one contiguous block, and by the time the web server and
@@ -110,6 +122,11 @@ void handleTailscale() {
       Log.println("[TS] microlink_start failed.");
       return;
     }
+
+    // WireGuard stamps each handshake with the time, and peers refuse one
+    // older than the last they saw from this key. Wall-clock time keeps that
+    // true across reboots; the uplink the tailnet needs is all SNTP needs.
+    configTime(0, 0, "pool.ntp.org", "time.google.com");
 
     started = true;
     tsStatus.running = true;

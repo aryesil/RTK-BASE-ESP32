@@ -68,9 +68,38 @@ CONFIG_MBEDTLS_CHACHA20_C=y
 CONFIG_MBEDTLS_POLY1305_C=y
 CONFIG_MBEDTLS_CHACHAPOLY_C=y
 
-# DERP frames are small. The IDF default of 16KB in + 16KB out per TLS session
-# is 26KB of heap this board cannot spare.
-CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096
+# The receive side has to accept a full 16KB record. DERP frames are small,
+# but the relay is a Go TLS server and Go grows its record size as a
+# connection carries data: past the first few records it writes anything up to
+# 16KB, and with a 4KB input buffer mbedTLS rejects the record and the relay
+# connection drops - exactly when a page is loading through the tunnel.
+# Dynamic buffers make that affordable: records are allocated at the size that
+# arrives and released once read, so an idle session holds almost nothing
+# instead of the fixed 4KB + 2KB it held before.
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=2048
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+# The relay connection lives for the whole boot, and by default it keeps the
+# server's parsed certificate chain for all of it. Nothing reads it after the
+# handshake, so keep only its digest.
+CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=n
+
+# --- lwIP ------------------------------------------------------------------
+# Sockets in use with the client on: OTA 1, RTCM TCP listener 1 + up to 4
+# consumers, UDP output 1, NTRIP push 2, microlink up to 6 (control, relay,
+# DISCO v4/v6, STUN v4/v6). The default of 10 ran out as soon as a couple of
+# rovers connected, and the next relay or control reconnect could not open a
+# socket at all. Each slot is a few dozen bytes.
+CONFIG_LWIP_MAX_SOCKETS=16
+# The TCP/IP thread runs at priority 18 and was free to land on core 1, where
+# it preempts the GNSS serial path. Everything else networking is on core 0.
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
+# The WireGuard manager task decrypts tunnel packets and drives the WireGuard
+# state that the TCP/IP thread uses to encrypt. It takes the lwIP core lock
+# around that work; without core locking there is no lock to take, and a
+# tunnel packet racing the TCP/IP thread crashed the board in tcp_output.
+# Socket calls also take the lock directly instead of posting a message and
+# waiting for the thread, which is cheaper.
+CONFIG_LWIP_TCPIP_CORE_LOCKING=y
 
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y

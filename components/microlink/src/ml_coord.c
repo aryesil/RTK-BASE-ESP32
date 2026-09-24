@@ -43,6 +43,8 @@ static const char *TAG = "ml_coord";
 static uint8_t s_node_key_challenge[32] = {0};
 static bool s_has_node_key_challenge = false;
 
+static uint16_t preferred_derp(const microlink_t *ml);
+
 /* Coordination state machine */
 typedef enum {
     COORD_IDLE,
@@ -138,29 +140,47 @@ static int coord_recv(microlink_t *ml, uint8_t *buf, size_t len) {
  * Noise-encrypted transport I/O
  * ========================================================================== */
 
-/* Send a Noise transport frame: [0x04][len_hi][len_lo][encrypted_data+MAC] */
+/* controlbase caps a transport frame at 4096 bytes on the wire, header and MAC
+ * included, and drops the connection on anything larger. HTTP/2 above it is a
+ * byte stream, so a long request is simply carried in several frames. */
+#define ML_NOISE_MAX_FRAME      4096
+#define ML_NOISE_MAX_PLAINTEXT  (ML_NOISE_MAX_FRAME - 3 - 16)
+
+/* Send Noise transport frames: [0x04][len_hi][len_lo][encrypted_data+MAC] */
 static int noise_send(microlink_t *ml, ml_noise_state_t *noise,
                         const uint8_t *plaintext, size_t pt_len) {
-    size_t ct_len = pt_len + 16;  /* ciphertext + 16-byte MAC */
-    uint8_t *frame = ml_psram_malloc(3 + ct_len);
+    size_t first = pt_len < ML_NOISE_MAX_PLAINTEXT ? pt_len : ML_NOISE_MAX_PLAINTEXT;
+    uint8_t *frame = ml_psram_malloc(3 + first + 16);
     if (!frame) return -1;
 
-    frame[0] = 0x04;  /* Transport data frame type */
-    frame[1] = (ct_len >> 8) & 0xFF;
-    frame[2] = ct_len & 0xFF;
+    size_t off = 0;
+    do {
+        size_t chunk = pt_len - off;
+        if (chunk > ML_NOISE_MAX_PLAINTEXT) chunk = ML_NOISE_MAX_PLAINTEXT;
+        size_t ct_len = chunk + 16;  /* ciphertext + 16-byte MAC */
 
-    if (ml_noise_encrypt(noise->tx_key, noise->tx_nonce,
-                          NULL, 0,
-                          plaintext, pt_len,
-                          frame + 3) != ESP_OK) {
-        free(frame);
-        return -1;
-    }
-    noise->tx_nonce++;
+        frame[0] = 0x04;  /* Transport data frame type */
+        frame[1] = (ct_len >> 8) & 0xFF;
+        frame[2] = ct_len & 0xFF;
 
-    int ret = coord_send(ml, frame, 3 + ct_len);
+        if (ml_noise_encrypt(noise->tx_key, noise->tx_nonce,
+                              NULL, 0,
+                              plaintext + off, chunk,
+                              frame + 3) != ESP_OK) {
+            free(frame);
+            return -1;
+        }
+        noise->tx_nonce++;
+
+        if (coord_send(ml, frame, 3 + ct_len) < 0) {
+            free(frame);
+            return -1;
+        }
+        off += chunk;
+    } while (off < pt_len);
+
     free(frame);
-    return ret;
+    return 0;
 }
 
 /* Receive and decrypt a Noise transport frame, returns plaintext length */
@@ -201,7 +221,10 @@ static int noise_recv(microlink_t *ml, ml_noise_state_t *noise,
         return -1;
     }
 
-    uint8_t *ciphertext = ml_psram_malloc(ct_len);
+    /* ChaCha20-Poly1305 decrypts in place, so when the caller's buffer can
+     * hold the MAC too there is no reason for a second allocation. */
+    bool in_place = (max_len >= ct_len);
+    uint8_t *ciphertext = in_place ? plaintext : ml_psram_malloc(ct_len);
     if (!ciphertext) return -1;
 
     /* Header already consumed — payload read MUST complete or stream
@@ -215,7 +238,7 @@ static int noise_recv(microlink_t *ml, ml_noise_state_t *noise,
         }
         ESP_LOGE(TAG, "noise_recv payload failed: ct_len=%d retries=%d errno=%d",
                  ct_len, payload_retries, errno);
-        free(ciphertext);
+        if (!in_place) free(ciphertext);
         return -1;
     }
 
@@ -224,12 +247,12 @@ static int noise_recv(microlink_t *ml, ml_noise_state_t *noise,
                           ciphertext, ct_len,
                           plaintext) != ESP_OK) {
         ESP_LOGE(TAG, "Noise decrypt failed (nonce=%llu)", (unsigned long long)noise->rx_nonce);
-        free(ciphertext);
+        if (!in_place) free(ciphertext);
         return -1;
     }
     noise->rx_nonce++;
 
-    free(ciphertext);
+    if (!in_place) free(ciphertext);
     return (int)pt_len;
 }
 
@@ -274,6 +297,13 @@ static int do_tcp_connect(microlink_t *ml) {
     ml_setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
     ml_setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
     ml_setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+
+    /* Every write here is a whole Noise frame. With Nagle on, a PONG or a
+     * WINDOW_UPDATE written behind a not-yet-acknowledged segment waits one
+     * full round trip before it leaves - long enough for the server's own
+     * ping deadline to count it as missing. */
+    int nodelay = 1;
+    ml_setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
     ESP_LOGI(TAG, "Connecting to %s:80...", CTRL_HOST(ml));
 
@@ -747,7 +777,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     {
         cJSON *netinfo = cJSON_CreateObject();
         if (netinfo) {
-            cJSON_AddNumberToObject(netinfo, "PreferredDERP", ML_DERP_REGION);
+            cJSON_AddNumberToObject(netinfo, "PreferredDERP", preferred_derp(ml));
             cJSON_AddItemToObject(hostinfo, "NetInfo", netinfo);
         }
     }
@@ -1351,6 +1381,203 @@ check_removed:
 /* Add Endpoints + EndpointTypes arrays to a MapRequest JSON object.
  * Includes: WiFi LAN endpoint (type=Local), STUN IPv4 (type=STUN),
  * STUN IPv6 (type=STUN). Returns number of endpoints added. */
+/* ============================================================================
+ * DERP home region selection
+ *
+ * The client used to advertise region 9 (Dallas) as its home no matter where
+ * it was. Peers reach a node through its home relay, so from Turkey every
+ * relayed packet crossed the Atlantic twice - 250 ms or more before the tunnel
+ * even started, which a TCP session carrying the web interface feels on every
+ * round trip. This measures instead, the way tailscale's netcheck does: one
+ * STUN binding request to every region, lowest round trip wins.
+ *
+ * The choice is made once per boot and then kept. The relay connection stays
+ * up across control-plane reconnects, so advertising a different region later
+ * would send peers to a relay this node is not connected to.
+ * ========================================================================== */
+
+#define NC_MAX_CAND     48
+#define NC_WAIT_MS      1200
+
+static uint16_t s_derp_pref = 0;                        /* measured home, 0 = none */
+static uint16_t s_derp_rank[ML_MAX_DERP_REGIONS];       /* best first */
+static uint8_t  s_derp_rank_n = 0;
+
+static uint16_t preferred_derp(const microlink_t *ml) {
+    if (s_derp_pref) return s_derp_pref;
+    return ml->derp_home_region ? ml->derp_home_region : ML_DERP_REGION;
+}
+
+typedef struct {
+    uint16_t region;
+    uint16_t port;
+    uint32_t ip;        /* host byte order */
+    uint32_t rtt_ms;    /* UINT32_MAX = no answer */
+} nc_cand_t;
+
+static bool nc_region_usable(cJSON *region_obj) {
+    cJSON *avoid = cJSON_GetObjectItem(region_obj, "Avoid");
+    cJSON *nomh = cJSON_GetObjectItem(region_obj, "NoMeasureNoHome");
+    return !(avoid && cJSON_IsTrue(avoid)) && !(nomh && cJSON_IsTrue(nomh));
+}
+
+static void nc_measure(microlink_t *ml, cJSON *regions) {
+    nc_cand_t *c = calloc(NC_MAX_CAND, sizeof(nc_cand_t));
+    if (!c) return;
+    int n = 0;
+
+    cJSON *region_obj;
+    cJSON_ArrayForEach(region_obj, regions) {
+        if (n >= NC_MAX_CAND) break;
+        if (!nc_region_usable(region_obj)) continue;
+        cJSON *rid = cJSON_GetObjectItem(region_obj, "RegionID");
+        cJSON *nodes = cJSON_GetObjectItem(region_obj, "Nodes");
+        if (!rid || !nodes) continue;
+        cJSON *node_obj;
+        cJSON_ArrayForEach(node_obj, nodes) {
+            cJSON *ip4 = cJSON_GetObjectItem(node_obj, "IPv4");
+            cJSON *sp = cJSON_GetObjectItem(node_obj, "STUNPort");
+            int port = sp ? (int)sp->valuedouble : 0;
+            if (port < 0) continue;                   /* STUN disabled on this node */
+            unsigned a, b, cc, d;
+            if (!ip4 || !ip4->valuestring ||
+                sscanf(ip4->valuestring, "%u.%u.%u.%u", &a, &b, &cc, &d) != 4) continue;
+            c[n].region = (uint16_t)rid->valuedouble;
+            c[n].port = port ? (uint16_t)port : 3478;
+            c[n].ip = (a << 24) | (b << 16) | (cc << 8) | d;
+            c[n].rtt_ms = UINT32_MAX;
+            n++;
+            break;                                    /* one node per region */
+        }
+    }
+    if (n == 0) { free(c); return; }
+
+    /* 10 random bytes identify this sweep, the last 2 the candidate. */
+    uint8_t txid[12];
+    esp_fill_random(txid, 10);
+    uint64_t sent_ms[NC_MAX_CAND];
+    for (int i = 0; i < n; i++) {
+        txid[10] = (uint8_t)(i >> 8);
+        txid[11] = (uint8_t)i;
+        sent_ms[i] = ml_get_time_ms();
+        ml_stun_send_probe_txid(ml, c[i].ip, c[i].port, txid);
+        vTaskDelay(pdMS_TO_TICKS(3));     /* no burst for the NAT or the queue */
+    }
+
+    int answered = 0;
+    uint64_t deadline = ml_get_time_ms() + NC_WAIT_MS;
+    while (answered < n && ml_get_time_ms() < deadline) {
+        ml_rx_packet_t pkt;
+        if (xQueueReceive(ml->stun_rx_queue, &pkt, pdMS_TO_TICKS(20)) != pdTRUE) continue;
+        uint64_t now = ml_get_time_ms();
+        if (pkt.len >= 20 && pkt.data[0] == 0x01 && pkt.data[1] == 0x01 &&
+            memcmp(pkt.data + 8, txid, 10) == 0) {
+            int i = (pkt.data[18] << 8) | pkt.data[19];
+            if (i < n && c[i].rtt_ms == UINT32_MAX) {
+                c[i].rtt_ms = (uint32_t)(now - sent_ms[i]);
+                answered++;
+            }
+        }
+        /* Anything else is a mapping probe answered mid-sweep; the retry
+         * logic in the long-poll loop sends it again. */
+        free(pkt.data);
+    }
+
+    /* Keep the best few, in order. n is small, a selection pass is enough. */
+    s_derp_rank_n = 0;
+    for (int k = 0; k < ML_MAX_DERP_REGIONS; k++) {
+        int best = -1;
+        for (int i = 0; i < n; i++) {
+            if (c[i].rtt_ms == UINT32_MAX) continue;
+            if (best < 0 || c[i].rtt_ms < c[best].rtt_ms) best = i;
+        }
+        if (best < 0) break;
+        ESP_LOGI(TAG, "DERP region %u: %lu ms", c[best].region,
+                 (unsigned long)c[best].rtt_ms);
+        s_derp_rank[s_derp_rank_n++] = c[best].region;
+        if (k == 0) {
+            s_derp_pref = c[best].region;
+            /* The mapping probes go to the nearest relay too. */
+            if (c[best].port == ML_STUN_PRIMARY_PORT) ml->stun_primary_ip = c[best].ip;
+        }
+        c[best].rtt_ms = UINT32_MAX;
+    }
+    ESP_LOGW(TAG, "DERP home region %u (%d of %d regions answered)",
+             s_derp_pref, answered, n);
+    free(c);
+}
+
+/* Fill ml->derp_regions from the DERPMap: the measured regions in rank order,
+ * or, before any measurement, the home region first and then whatever fits. */
+static void nc_fill_table(microlink_t *ml, cJSON *regions) {
+    uint16_t want[ML_MAX_DERP_REGIONS];
+    int want_n = 0;
+    if (s_derp_rank_n) {
+        for (int i = 0; i < s_derp_rank_n; i++) want[want_n++] = s_derp_rank[i];
+    } else if (ml->derp_home_region) {
+        want[want_n++] = ml->derp_home_region;
+    }
+
+    ml->derp_region_count = 0;
+    /* Pass 0 takes the wanted regions in order, pass 1 tops the table up. */
+    for (int pass = 0; pass < 2; pass++) {
+        int slots = pass == 0 ? want_n : ML_MAX_DERP_REGIONS;
+        for (int w = 0; w < slots && ml->derp_region_count < ML_MAX_DERP_REGIONS; w++) {
+            cJSON *region_obj;
+            cJSON_ArrayForEach(region_obj, regions) {
+                if (ml->derp_region_count >= ML_MAX_DERP_REGIONS) break;
+                cJSON *rid = cJSON_GetObjectItem(region_obj, "RegionID");
+                if (!rid) continue;
+                uint16_t id = (uint16_t)rid->valuedouble;
+                if (pass == 0 && id != want[w]) continue;
+                if (pass == 1 && !nc_region_usable(region_obj)) continue;
+                bool have = false;
+                for (int k = 0; k < ml->derp_region_count; k++)
+                    if (ml->derp_regions[k].region_id == id) have = true;
+                if (have) continue;
+
+                ml_derp_region_t *r = &ml->derp_regions[ml->derp_region_count];
+                memset(r, 0, sizeof(*r));
+                r->region_id = id;
+                cJSON *rcode = cJSON_GetObjectItem(region_obj, "RegionCode");
+                if (rcode && rcode->valuestring)
+                    strncpy(r->code, rcode->valuestring, sizeof(r->code) - 1);
+                cJSON *avoid = cJSON_GetObjectItem(region_obj, "Avoid");
+                if (avoid && cJSON_IsTrue(avoid)) r->avoid = true;
+
+                cJSON *nodes = cJSON_GetObjectItem(region_obj, "Nodes");
+                cJSON *node_obj;
+                if (nodes) cJSON_ArrayForEach(node_obj, nodes) {
+                    if (r->node_count >= ML_MAX_DERP_NODES) break;
+                    ml_derp_node_t *nd = &r->nodes[r->node_count];
+                    memset(nd, 0, sizeof(*nd));
+                    cJSON *hn = cJSON_GetObjectItem(node_obj, "HostName");
+                    if (hn && hn->valuestring)
+                        strncpy(nd->hostname, hn->valuestring, sizeof(nd->hostname) - 1);
+                    cJSON *ip4 = cJSON_GetObjectItem(node_obj, "IPv4");
+                    if (ip4 && ip4->valuestring)
+                        strncpy(nd->ipv4, ip4->valuestring, sizeof(nd->ipv4) - 1);
+                    cJSON *ip6 = cJSON_GetObjectItem(node_obj, "IPv6");
+                    if (ip6 && ip6->valuestring)
+                        strncpy(nd->ipv6, ip6->valuestring, sizeof(nd->ipv6) - 1);
+                    cJSON *sp = cJSON_GetObjectItem(node_obj, "STUNPort");
+                    if (sp) nd->stun_port = (uint16_t)sp->valuedouble;
+                    cJSON *dp = cJSON_GetObjectItem(node_obj, "DERPPort");
+                    if (dp) nd->derp_port = (uint16_t)dp->valuedouble;
+                    cJSON *so = cJSON_GetObjectItem(node_obj, "STUNOnly");
+                    if (so && cJSON_IsTrue(so)) nd->stun_only = true;
+                    r->node_count++;
+                }
+                ESP_LOGI(TAG, "  DERP region %d (%s): %d nodes%s", r->region_id, r->code,
+                         r->node_count, r->avoid ? " [avoid]" : "");
+                ml->derp_region_count++;
+                if (pass == 0) break;
+            }
+        }
+    }
+    ESP_LOGI(TAG, "DERPMap: kept %d regions", ml->derp_region_count);
+}
+
 static int add_endpoints_to_json(microlink_t *ml, cJSON *root) {
     int count = 0;
     cJSON *ep_array = cJSON_AddArrayToObject(root, "Endpoints");
@@ -1461,7 +1688,7 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
      * to populate Node.HomeDERP for other peers. */
     cJSON *netinfo = cJSON_CreateObject();
     if (netinfo) {
-        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ML_DERP_REGION);
+        cJSON_AddNumberToObject(netinfo, "PreferredDERP", preferred_derp(ml));
         if (ml->stun_nat_checked) {
             cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
         }
@@ -1834,81 +2061,14 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
      * parsed last, once everything else has been read and released. */
     span = json_top_span(parse_start, parse_len, "DERPMap", &span_len);
     cJSON *derp_map = json_parse_span(span, span_len);
+    if (derp_map && !s_derp_pref) {
+        cJSON *regions = cJSON_GetObjectItem(derp_map, "Regions");
+        if (regions) nc_measure(ml, regions);
+    }
+    if (s_derp_pref) ml->derp_home_region = s_derp_pref;
     if (derp_map) {
         cJSON *regions = cJSON_GetObjectItem(derp_map, "Regions");
-        if (regions) {
-            ml->derp_region_count = 0;
-            cJSON *region_obj;
-            cJSON_ArrayForEach(region_obj, regions) {
-                if (ml->derp_region_count >= ML_MAX_DERP_REGIONS) break;
-                ml_derp_region_t *r = &ml->derp_regions[ml->derp_region_count];
-                memset(r, 0, sizeof(*r));
-
-                cJSON *rid = cJSON_GetObjectItem(region_obj, "RegionID");
-                if (rid) r->region_id = (uint16_t)rid->valuedouble;
-
-                cJSON *rcode = cJSON_GetObjectItem(region_obj, "RegionCode");
-                if (rcode && rcode->valuestring) {
-                    strncpy(r->code, rcode->valuestring, sizeof(r->code) - 1);
-                }
-
-                cJSON *avoid = cJSON_GetObjectItem(region_obj, "Avoid");
-                if (avoid && cJSON_IsTrue(avoid)) r->avoid = true;
-
-                /* Parse nodes */
-                cJSON *nodes = cJSON_GetObjectItem(region_obj, "Nodes");
-                if (nodes) {
-                    cJSON *node_obj;
-                    cJSON_ArrayForEach(node_obj, nodes) {
-                        if (r->node_count >= ML_MAX_DERP_NODES) break;
-                        ml_derp_node_t *n = &r->nodes[r->node_count];
-                        memset(n, 0, sizeof(*n));
-
-                        cJSON *hn = cJSON_GetObjectItem(node_obj, "HostName");
-                        if (hn && hn->valuestring) {
-                            strncpy(n->hostname, hn->valuestring, sizeof(n->hostname) - 1);
-                        }
-
-                        cJSON *ip4 = cJSON_GetObjectItem(node_obj, "IPv4");
-                        if (ip4 && ip4->valuestring) {
-                            strncpy(n->ipv4, ip4->valuestring, sizeof(n->ipv4) - 1);
-                        }
-
-                        cJSON *ip6 = cJSON_GetObjectItem(node_obj, "IPv6");
-                        if (ip6 && ip6->valuestring) {
-                            strncpy(n->ipv6, ip6->valuestring, sizeof(n->ipv6) - 1);
-                        }
-
-                        cJSON *sp = cJSON_GetObjectItem(node_obj, "STUNPort");
-                        if (sp) n->stun_port = (uint16_t)sp->valuedouble;
-
-                        cJSON *dp = cJSON_GetObjectItem(node_obj, "DERPPort");
-                        if (dp) n->derp_port = (uint16_t)dp->valuedouble;
-
-                        cJSON *so = cJSON_GetObjectItem(node_obj, "STUNOnly");
-                        if (so && cJSON_IsTrue(so)) n->stun_only = true;
-
-                        r->node_count++;
-                    }
-                }
-
-                ESP_LOGI(TAG, "  DERP region %d (%s): %d nodes%s",
-                         r->region_id, r->code, r->node_count,
-                         r->avoid ? " [avoid]" : "");
-                for (int ni = 0; ni < r->node_count; ni++) {
-                    ESP_LOGI(TAG, "    node: %s (v4=%s v6=%s stun=%d derp=%d%s)",
-                             r->nodes[ni].hostname,
-                             r->nodes[ni].ipv4[0] ? r->nodes[ni].ipv4 : "-",
-                             r->nodes[ni].ipv6[0] ? r->nodes[ni].ipv6 : "-",
-                             r->nodes[ni].stun_port ? r->nodes[ni].stun_port : 3478,
-                             r->nodes[ni].derp_port ? r->nodes[ni].derp_port : 443,
-                             r->nodes[ni].stun_only ? " stun-only" : "");
-                }
-
-                ml->derp_region_count++;
-            }
-            ESP_LOGI(TAG, "DERPMap: parsed %d regions", ml->derp_region_count);
-        }
+        if (regions) nc_fill_table(ml, regions);
     }
 
     cJSON_Delete(derp_map);
@@ -1960,7 +2120,7 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
      * to populate Node.HomeDERP for other peers. */
     cJSON *netinfo = cJSON_CreateObject();
     if (netinfo) {
-        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ML_DERP_REGION);
+        cJSON_AddNumberToObject(netinfo, "PreferredDERP", preferred_derp(ml));
         if (ml->stun_nat_checked) {
             cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
         }
@@ -2022,10 +2182,25 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
  *
  * Uses H2 stream 7. Response body is discarded (only HTTP status matters).
  * Returns 0 on success, -1 on send failure. */
+/* Last endpoint set sent on this connection. The periodic STUN re-probe lands
+ * every 23 s and each result used to trigger an update even when nothing had
+ * changed: a new HTTP/2 stream each time, and a map delta pushed to every peer
+ * on the tailnet for a node that had not moved. */
+static uint32_t s_ep_ip = 0;
+static uint16_t s_ep_port = 0, s_ep_port6 = 0;
+static uint64_t s_ep_sent_ms = 0;
+#define ML_EP_REFRESH_MS  (10 * 60 * 1000)
+
 static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
     if (ml->stun_public_ip == 0 && !ml->stun_has_ipv6) {
         ESP_LOGD(TAG, "No STUN endpoints yet, skipping endpoint update");
         return 0;  /* Nothing to send */
+    }
+    uint64_t now_ms = ml_get_time_ms();
+    if (s_ep_sent_ms && ml->stun_public_ip == s_ep_ip &&
+        ml->stun_public_port == s_ep_port && ml->stun_public_port6 == s_ep_port6 &&
+        now_ms - s_ep_sent_ms < ML_EP_REFRESH_MS) {
+        return 0;
     }
 
     cJSON *root = cJSON_CreateObject();
@@ -2061,7 +2236,7 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
 
         cJSON *netinfo = cJSON_CreateObject();
         if (netinfo) {
-            cJSON_AddNumberToObject(netinfo, "PreferredDERP", ML_DERP_REGION);
+            cJSON_AddNumberToObject(netinfo, "PreferredDERP", preferred_derp(ml));
             if (ml->stun_nat_checked) {
                 cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
             }
@@ -2113,6 +2288,10 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
     }
     free(h2_buf);
 
+    s_ep_ip = ml->stun_public_ip;
+    s_ep_port = ml->stun_public_port;
+    s_ep_port6 = ml->stun_public_port6;
+    s_ep_sent_ms = now_ms;
     ESP_LOGI(TAG, "Endpoint update sent on H2 stream %lu", (unsigned long)sid);
     /* Response body is discarded — server may send empty response or
      * we'll consume it in the next poll_map_update() iteration.
@@ -2120,145 +2299,271 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
     return 0;
 }
 
-/* Try to read one incremental MapResponse update (non-blocking) */
+/* ============================================================================
+ * Long-poll receive path
+ *
+ * Three framings are stacked here and none of them lines up with the others:
+ * Noise transport frames are at most 4 kB, HTTP/2 frames are up to 16 kB and
+ * are cut wherever a Noise frame ends, and the MapResponse messages carried on
+ * stream 5 ([4-byte little-endian length][JSON]) span as many DATA frames as
+ * they need. The original loop treated every Noise frame as a whole set of
+ * HTTP/2 frames: anything that straddled a boundary was dropped, the frames
+ * after it were parsed from the wrong offset, and the dropped DATA bytes were
+ * never returned to the server as flow-control credit. The stream window then
+ * drained until the server could no longer deliver even its keepalives, and it
+ * closed the connection - the errno 104 that kept taking the node offline.
+ *
+ * It also asked for a 64 kB buffer on every read. On this board the largest
+ * free block is about 51 kB, so the allocation failed, nothing was read at all,
+ * and the server's HTTP/2 PINGs went unanswered.
+ *
+ * This is a byte-level state machine instead. It keeps its place across Noise
+ * frames, credits every DATA byte, and needs no allocation: messages are
+ * assembled in the map buffer claimed at boot, whose top 4 kB doubles as the
+ * scratch space a single Noise frame is decrypted into.
+ * ========================================================================== */
+
+#define LP_SCRATCH      (ML_H2_BUFFER_SIZE - ML_NOISE_MAX_FRAME)  /* offset */
+#define LP_MSG_CAP      (LP_SCRATCH - 1)                          /* room for NUL */
+#define LP_STREAM       5
+#define LP_MSG_INSANE   (4u * 1024 * 1024)  /* a length this big means lost framing */
+
+static struct {
+    uint8_t  hdr[9];        /* HTTP/2 frame header being collected */
+    uint8_t  hdr_have;
+    uint8_t  type;
+    uint8_t  flags;
+    uint32_t stream;
+    uint32_t left;          /* payload bytes of the current frame still to come */
+    uint32_t pad_left;      /* trailing padding of a PADDED DATA frame */
+    bool     need_pad_len;  /* next payload byte is the pad length */
+    uint8_t  ping[8];
+    uint8_t  ping_have;
+
+    uint8_t  mlen_b[4];     /* stream-5 message length prefix */
+    uint8_t  mlen_have;
+    uint32_t mlen;
+    uint32_t mhave;
+    bool     mskip;         /* message larger than the buffer: counted, not kept */
+
+    uint32_t credit_conn;   /* DATA bytes consumed since the last WINDOW_UPDATE */
+    uint32_t credit_s5;
+} s_lp;
+
+static void lp_reset(void) {
+    memset(&s_lp, 0, sizeof(s_lp));
+    s_ep_sent_ms = 0;       /* a new connection gets its endpoints again */
+}
+
+/* One complete MapResponse from the stream. Parsed section by section for the
+ * same reason as the initial map: a whole-document cJSON tree costs several
+ * times the document, and a delta can carry a DERPMap or a packet filter. */
+static void lp_handle_message(microlink_t *ml, const char *json, size_t len) {
+    size_t sl = 0;
+    const char *sp = json_top_span(json, len, "Node", &sl);
+    if (sp) {
+        cJSON *node = json_parse_span(sp, sl);
+        cJSON *addresses = node ? cJSON_GetObjectItem(node, "Addresses") : NULL;
+        if (addresses && cJSON_GetArraySize(addresses) > 0) {
+            const char *addr = cJSON_GetArrayItem(addresses, 0)->valuestring;
+            unsigned a, b, c, d;
+            if (addr && sscanf(addr, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
+                uint32_t new_ip = (a << 24) | (b << 16) | (c << 8) | d;
+                if (new_ip != ml->vpn_ip) {
+                    ml->vpn_ip = new_ip;
+                    ESP_LOGI(TAG, "VPN IP updated via long-poll");
+                }
+            }
+        }
+        cJSON_Delete(node);
+    }
+
+    static const char *const PK[] = { "Peers", "PeersChanged", "PeersRemoved",
+                                      "PeersChangedPatch" };
+    cJSON *peers_root = NULL;
+    for (unsigned i = 0; i < sizeof(PK) / sizeof(PK[0]); i++) {
+        sp = json_top_span(json, len, PK[i], &sl);
+        if (!sp) continue;
+        cJSON *v = json_parse_span(sp, sl);
+        if (!v) continue;
+        if (!peers_root) peers_root = cJSON_CreateObject();
+        if (peers_root) cJSON_AddItemToObject(peers_root, PK[i], v);
+        else cJSON_Delete(v);
+    }
+    if (peers_root) {
+        ESP_LOGI(TAG, "Long-poll MapResponse update (%u bytes)", (unsigned)len);
+        parse_peers_from_map_response(ml, peers_root);
+        cJSON_Delete(peers_root);
+    }
+}
+
+/* DATA payload on the long-poll stream: reassemble length-prefixed messages. */
+static int lp_stream_bytes(microlink_t *ml, const uint8_t *p, size_t n) {
+    while (n > 0) {
+        if (s_lp.mlen_have < 4) {
+            s_lp.mlen_b[s_lp.mlen_have++] = *p++;
+            n--;
+            if (s_lp.mlen_have == 4) {
+                s_lp.mlen = (uint32_t)s_lp.mlen_b[0] | ((uint32_t)s_lp.mlen_b[1] << 8) |
+                            ((uint32_t)s_lp.mlen_b[2] << 16) | ((uint32_t)s_lp.mlen_b[3] << 24);
+                s_lp.mhave = 0;
+                if (s_lp.mlen > LP_MSG_INSANE) {
+                    ESP_LOGW(TAG, "Long-poll framing lost (length %lu)",
+                             (unsigned long)s_lp.mlen);
+                    return -1;
+                }
+                s_lp.mskip = s_lp.mlen > LP_MSG_CAP;
+                if (s_lp.mskip) {
+                    ESP_LOGW(TAG, "Long-poll message %lu bytes exceeds %u, skipped",
+                             (unsigned long)s_lp.mlen, (unsigned)LP_MSG_CAP);
+                }
+                if (s_lp.mlen == 0) s_lp.mlen_have = 0;
+            }
+            continue;
+        }
+        uint32_t take = s_lp.mlen - s_lp.mhave;
+        if (take > n) take = n;
+        if (!s_lp.mskip) memcpy(s_map_buf + s_lp.mhave, p, take);
+        s_lp.mhave += take;
+        p += take;
+        n -= take;
+        if (s_lp.mhave == s_lp.mlen) {
+            if (!s_lp.mskip) {
+                s_map_buf[s_lp.mlen] = '\0';
+                lp_handle_message(ml, (const char *)s_map_buf, s_lp.mlen);
+            }
+            s_lp.mlen_have = 0;
+        }
+    }
+    return 0;
+}
+
+/* Feed decrypted HTTP/2 bytes. Returns -1 when the long-poll is over. */
+static int lp_feed(microlink_t *ml, ml_noise_state_t *noise,
+                   const uint8_t *p, size_t n) {
+    /* The second condition finishes a zero-length frame (SETTINGS ACK, an
+     * empty END_STREAM) whose header was the last thing in the buffer. */
+    while (n > 0 || (s_lp.hdr_have == 9 && s_lp.left == 0)) {
+        if (s_lp.hdr_have < 9) {
+            size_t take = 9 - s_lp.hdr_have;
+            if (take > n) take = n;
+            memcpy(s_lp.hdr + s_lp.hdr_have, p, take);
+            s_lp.hdr_have += take;
+            p += take;
+            n -= take;
+            if (s_lp.hdr_have < 9) break;
+
+            s_lp.left   = ((uint32_t)s_lp.hdr[0] << 16) | ((uint32_t)s_lp.hdr[1] << 8) | s_lp.hdr[2];
+            s_lp.type   = s_lp.hdr[3];
+            s_lp.flags  = s_lp.hdr[4];
+            s_lp.stream = ((uint32_t)(s_lp.hdr[5] & 0x7F) << 24) | ((uint32_t)s_lp.hdr[6] << 16) |
+                          ((uint32_t)s_lp.hdr[7] << 8) | s_lp.hdr[8];
+            s_lp.ping_have = 0;
+            s_lp.pad_left = 0;
+            s_lp.need_pad_len = (s_lp.type == 0x00 && (s_lp.flags & 0x08) && s_lp.left > 0);
+
+            if (s_lp.type == 0x00) {
+                /* Flow control counts the whole frame, padding included. */
+                s_lp.credit_conn += s_lp.left;
+                if (s_lp.stream == LP_STREAM) s_lp.credit_s5 += s_lp.left;
+            } else if (s_lp.type == 0x07) {
+                ESP_LOGW(TAG, "Server sent GOAWAY");
+                return -1;
+            } else if (s_lp.type == 0x03 && s_lp.stream == LP_STREAM) {
+                ESP_LOGW(TAG, "Long-poll stream reset by server");
+                return -1;
+            } else if (s_lp.type == 0x04 && !(s_lp.flags & 0x01)) {
+                static const uint8_t ack[9] = {0x00, 0x00, 0x00, 0x04, 0x01,
+                                               0x00, 0x00, 0x00, 0x00};
+                if (noise_send(ml, noise, ack, sizeof(ack)) < 0) return -1;
+            }
+        }
+
+        /* Payload of the current frame (possibly empty). */
+        size_t take = s_lp.left;
+        if (take > n) take = n;
+
+        if (s_lp.type == 0x00 && s_lp.stream == LP_STREAM) {
+            const uint8_t *q = p;
+            size_t m = take;
+            if (s_lp.need_pad_len && m > 0) {
+                s_lp.pad_left = *q++;
+                m--;
+                s_lp.need_pad_len = false;
+            }
+            /* Bytes of this chunk that belong to the payload, not the padding:
+             * the padding is the last pad_left bytes of the frame. */
+            size_t frame_after = s_lp.left - take;     /* still to come after this chunk */
+            size_t pad_here = 0;
+            if (s_lp.pad_left > frame_after) pad_here = s_lp.pad_left - frame_after;
+            if (pad_here > m) pad_here = m;
+            if (lp_stream_bytes(ml, q, m - pad_here) < 0) return -1;
+        } else if (s_lp.type == 0x06 && !(s_lp.flags & 0x01)) {
+            for (size_t i = 0; i < take && s_lp.ping_have < 8; i++)
+                s_lp.ping[s_lp.ping_have++] = p[i];
+        }
+
+        p += take;
+        n -= take;
+        s_lp.left -= take;
+
+        if (s_lp.left == 0) {
+            if (s_lp.type == 0x06 && !(s_lp.flags & 0x01) && s_lp.ping_have == 8) {
+                uint8_t pong[17] = {0x00, 0x00, 0x08, 0x06, 0x01, 0x00, 0x00, 0x00, 0x00};
+                memcpy(pong + 9, s_lp.ping, 8);
+                if (noise_send(ml, noise, pong, sizeof(pong)) < 0) return -1;
+            }
+            if (s_lp.type == 0x00 && s_lp.stream == LP_STREAM && (s_lp.flags & 0x01)) {
+                ESP_LOGW(TAG, "Long-poll stream ended by server");
+                return -1;
+            }
+            s_lp.hdr_have = 0;
+        }
+    }
+    return 0;
+}
+
+/* Read whatever the control connection has ready without blocking the task.
+ * Returns 1 if anything arrived, 0 if nothing did, -1 if the connection is
+ * lost. */
 static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
-    /* Use select() to check if data is available before blocking in recv */
-    fd_set readfds;
-    FD_ZERO(&readfds);
-    FD_SET(ml->coord_sock, &readfds);
-    struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };  /* 50ms */
-    int sel = ml_select_fds(ml->coord_sock + 1, &readfds, NULL, NULL, &tv);
-    if (sel <= 0) return 0;  /* No data available or error */
+    uint8_t *scratch = s_map_buf ? s_map_buf + LP_SCRATCH : NULL;
+    if (!scratch) return -1;
 
-    /* Data available — set short recv timeout for partial frame safety */
-    struct timeval tv_recv = { .tv_sec = 2, .tv_usec = 0 };
-    ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_RCVTIMEO, &tv_recv, sizeof(tv_recv));
+    int got = 0;
+    /* Bounded so a burst cannot hold the task; the rest is read next pass. */
+    for (int frames = 0; frames < 8; frames++) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(ml->coord_sock, &readfds);
+        struct timeval tv = { .tv_sec = 0, .tv_usec = frames ? 0 : 50000 };
+        int sel = ml_select_fds(ml->coord_sock + 1, &readfds, NULL, NULL, &tv);
+        if (sel <= 0) break;
 
-    uint8_t *frame_buf = ml_psram_malloc(65536);
-    if (!frame_buf) return 0;
+        /* Data is waiting; a started frame must finish or alignment is lost. */
+        struct timeval tv_recv = { .tv_sec = 2, .tv_usec = 0 };
+        ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_RCVTIMEO, &tv_recv, sizeof(tv_recv));
 
-    int frame_len = noise_recv(ml, noise, frame_buf, 65536);
-
-    if (frame_len <= 0) {
-        free(frame_buf);
-        int saved_errno = errno;
-        /* EAGAIN/EWOULDBLOCK = no data yet = not an error */
-        if (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) return 0;
-        return frame_len;  /* Real error or connection closed */
-    }
-
-    /* Extract DATA frame payload from H2 frames, track flow control */
-    uint8_t *json_data = NULL;
-    size_t json_data_len = 0;
-    uint32_t total_data_bytes = 0;
-    uint32_t data_stream_id = 0;
-    int pos = 0;
-
-    while (pos + 9 <= frame_len) {
-        uint32_t f_len = (frame_buf[pos] << 16) | (frame_buf[pos + 1] << 8) | frame_buf[pos + 2];
-        uint8_t f_type = frame_buf[pos + 3];
-        uint8_t f_flags = frame_buf[pos + 4];
-        uint32_t f_stream = ((frame_buf[pos + 5] & 0x7F) << 24) | (frame_buf[pos + 6] << 16) |
-                             (frame_buf[pos + 7] << 8) | frame_buf[pos + 8];
-        pos += 9;
-
-        if (pos + (int)f_len > frame_len) break;
-
-        if (f_type == 0x00) {  /* DATA frame */
-            total_data_bytes += f_len;
-            if (f_stream == 5) {
-                /* Long-poll MapResponse data (stream 5) — parse as JSON */
-                data_stream_id = f_stream;
-                if (f_len > 0) {
-                    json_data = frame_buf + pos;
-                    json_data_len = f_len;
-                }
-            } else if (f_len > 0) {
-                /* Endpoint update response (stream 7+) — discard body */
-                ESP_LOGD(TAG, "H2 stream %lu DATA: %lu bytes (discarded)",
-                         (unsigned long)f_stream, (unsigned long)f_len);
-            }
-        } else if (f_type == 0x06 && f_len == 8 && !(f_flags & 0x01)) {
-            /* HTTP/2 PING from server — respond with PONG (same payload, ACK flag) */
-            uint8_t pong[17];
-            pong[0] = 0x00; pong[1] = 0x00; pong[2] = 0x08;
-            pong[3] = 0x06; pong[4] = 0x01;
-            pong[5] = 0x00; pong[6] = 0x00; pong[7] = 0x00; pong[8] = 0x00;
-            memcpy(pong + 9, frame_buf + pos, 8);
-            noise_send(ml, noise, pong, sizeof(pong));
-            ESP_LOGI(TAG, "Sent HTTP/2 PONG in response to server PING");
-        } else if (f_type == 0x04 && !(f_flags & 0x01)) {
-            /* HTTP/2 SETTINGS from server — respond with SETTINGS ACK */
-            uint8_t settings_ack[9] = {0x00, 0x00, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00};
-            noise_send(ml, noise, settings_ack, sizeof(settings_ack));
+        int len = noise_recv(ml, noise, scratch, ML_NOISE_MAX_FRAME);
+        if (len < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            return -1;
         }
-        pos += f_len;
+        got = 1;
+        if (lp_feed(ml, noise, scratch, (size_t)len) < 0) return -1;
     }
 
-    /* Send HTTP/2 WINDOW_UPDATE to replenish flow control after receiving DATA.
-     * Without this, the server's send window exhausts and the connection stalls.
-     * Must send for BOTH connection-level (stream 0) AND stream-level. (v1 reference) */
-    if (total_data_bytes > 0) {
-        uint8_t wu_buf[26];  /* 2 WINDOW_UPDATE frames: 13 bytes each */
-        /* Connection-level (stream 0) */
-        int wu_len = ml_h2_build_window_update(wu_buf, 13, 0, total_data_bytes);
-        /* Stream-level */
-        if (data_stream_id > 0) {
-            wu_len += ml_h2_build_window_update(wu_buf + wu_len, 13,
-                                                  data_stream_id, total_data_bytes);
-        }
-        noise_send(ml, noise, wu_buf, wu_len);
+    /* Hand the consumed bytes back to the server's send windows. */
+    if (s_lp.credit_conn > 0) {
+        uint8_t wu[26];
+        int wu_len = ml_h2_build_window_update(wu, 13, 0, s_lp.credit_conn);
+        if (s_lp.credit_s5 > 0)
+            wu_len += ml_h2_build_window_update(wu + wu_len, 13, LP_STREAM, s_lp.credit_s5);
+        if (noise_send(ml, noise, wu, wu_len) < 0) return -1;
+        s_lp.credit_conn = 0;
+        s_lp.credit_s5 = 0;
     }
-
-    if (!json_data || json_data_len == 0) {
-        /* Keepalive, SETTINGS, or PING frame - not an error */
-        free(frame_buf);
-        return 1;  /* Got data, reset watchdog */
-    }
-
-    /* Skip 4-byte length prefix if present */
-    char *parse_start = (char *)json_data;
-    size_t parse_len = json_data_len;
-    if (parse_len > 4 && parse_start[4] == '{') {
-        parse_start += 4;
-        parse_len -= 4;
-    }
-
-    char saved = parse_start[parse_len];
-    parse_start[parse_len] = '\0';
-
-    cJSON *update_json = cJSON_Parse(parse_start);
-    parse_start[parse_len] = saved;
-
-    if (update_json) {
-        ESP_LOGI(TAG, "Long-poll MapResponse update received");
-
-        /* Update VPN IP if present */
-        cJSON *node = cJSON_GetObjectItem(update_json, "Node");
-        if (node) {
-            cJSON *addresses = cJSON_GetObjectItem(node, "Addresses");
-            if (addresses && cJSON_GetArraySize(addresses) > 0) {
-                const char *addr = cJSON_GetArrayItem(addresses, 0)->valuestring;
-                if (addr) {
-                    unsigned a, b, c, d;
-                    if (sscanf(addr, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
-                        uint32_t new_ip = (a << 24) | (b << 16) | (c << 8) | d;
-                        if (new_ip != ml->vpn_ip) {
-                            ml->vpn_ip = new_ip;
-                            ESP_LOGI(TAG, "VPN IP updated via long-poll");
-                        }
-                    }
-                }
-            }
-        }
-
-        /* Parse peer updates */
-        parse_peers_from_map_response(ml, update_json);
-        cJSON_Delete(update_json);
-    }
-
-    free(frame_buf);
-    return 1;
+    return got;
 }
 
 /* ============================================================================
@@ -2425,6 +2730,7 @@ void ml_coord_task(void *arg) {
             }
 
             /* Start streaming long-poll for incremental updates */
+            lp_reset();
             if (do_start_long_poll(ml, &noise) < 0) {
                 ESP_LOGW(TAG, "Failed to start long-poll (non-fatal)");
             }

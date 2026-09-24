@@ -53,8 +53,7 @@ static void route_udp_packet(microlink_t *ml, uint8_t *data, size_t len,
                               uint32_t src_ip, uint16_t src_port) {
     pkt_type_t type = classify_packet(data, len);
 
-    /* Log ALL direct UDP packets for debugging */
-    ESP_LOGI(TAG, "UDP RX: %d bytes from %d.%d.%d.%d:%d type=%s hdr=%02x",
+    ESP_LOGD(TAG, "UDP RX: %d bytes from %d.%d.%d.%d:%d type=%s hdr=%02x",
              (int)len,
              (int)((src_ip >> 24) & 0xFF), (int)((src_ip >> 16) & 0xFF),
              (int)((src_ip >> 8) & 0xFF), (int)(src_ip & 0xFF),
@@ -80,11 +79,15 @@ static void route_udp_packet(microlink_t *ml, uint8_t *data, size_t len,
     case PKT_DISCO:
         if (xQueueSend(ml->disco_rx_queue, &pkt, 0) != pdTRUE) {
             free(data);
+        } else if (ml->wg_mgr_task) {
+            xTaskNotifyGive(ml->wg_mgr_task);
         }
         break;
     case PKT_WIREGUARD:
         if (xQueueSend(ml->wg_rx_queue, &pkt, 0) != pdTRUE) {
             free(data);
+        } else if (ml->wg_mgr_task) {
+            xTaskNotifyGive(ml->wg_mgr_task);
         }
         break;
     default:

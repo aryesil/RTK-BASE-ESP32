@@ -3,6 +3,7 @@
  * @brief ESP32 platform implementation for wireguard-lwip
  */
 
+#include <sys/time.h>
 #include "wireguard-platform.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -21,15 +22,23 @@ uint32_t wireguard_sys_now() {
 void wireguard_tai64n_now(uint8_t *output) {
     // TAI64N format: 8 bytes seconds + 4 bytes nanoseconds
     // For simplicity, use Unix epoch time
-    uint64_t now_us = esp_timer_get_time();
-    uint64_t seconds = now_us / 1000000ULL;
-    uint32_t nanoseconds = (now_us % 1000000ULL) * 1000;
-
-    // Log raw uptime before TAI offset (only every ~5s to avoid spam)
-    static uint64_t last_log_s = 0;
-    if (seconds - last_log_s >= 5) {
-        printf("[TAI64N] uptime=%llu s, nano=%lu\n", (unsigned long long)seconds, (unsigned long)nanoseconds);
-        last_log_s = seconds;
+    //
+    // Peers reject an initiation whose timestamp is not newer than the last
+    // one they accepted from this key, and the key survives reboots. Uptime
+    // restarts at zero, so after a reboot every handshake this device started
+    // was discarded as a replay until uptime overtook the previous run - it
+    // could not rekey its own sessions. Wall-clock time once SNTP has set it;
+    // uptime only before the first sync, when peers are the ones initiating.
+    uint64_t seconds;
+    uint32_t nanoseconds;
+    struct timeval tv;
+    if (gettimeofday(&tv, NULL) == 0 && tv.tv_sec > 1600000000) {
+        seconds = (uint64_t)tv.tv_sec;
+        nanoseconds = (uint32_t)tv.tv_usec * 1000;
+    } else {
+        uint64_t now_us = esp_timer_get_time();
+        seconds = now_us / 1000000ULL;
+        nanoseconds = (now_us % 1000000ULL) * 1000;
     }
 
     // TAI64 starts at 1970-01-01 00:00:10 TAI (Unix epoch + 10 seconds)
