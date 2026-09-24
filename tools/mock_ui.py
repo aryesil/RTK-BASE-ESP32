@@ -197,7 +197,7 @@ class Device:
                     "l5": 2 if self.jam_feat == 1 else -1},
             "arp": self.arp,
             "bc": self._bcast(base),
-            "io": self._iono(sig),
+            # The arcs themselves are served by /api/iono, as on the device.
             "ion": sum(1 for x in self._iono(sig) if x[2] > 0 and x[6] > 0),
             "iond": 0.041,
             "avg": self._avg(),
@@ -404,6 +404,8 @@ class Handler(BaseHTTPRequestHandler):
                 dev.sta_ssid = ""
             return self._text("OK")
 
+        if url.path == "/api/iono":
+            return self._json(dev._iono(dev.signals()))
         if url.path == "/api/history":
             body = dev.history_blob()
             self.send_response(200)
